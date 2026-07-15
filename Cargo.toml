@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sing-box-core",
+    "crates/sing-box-protocol-snell",
+    "crates/sing-box-protocol-hysteria2",
+    "crates/sing-box-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sing-snell = { path = "../sing-snell-rs" }
+sing-quic = { path = "../sing-quic-rs" }
+rustls-pemfile = "2"

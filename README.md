@@ -1,0 +1,130 @@
+# sing-box-rs
+
+`sing-box-rs` is a Tokio-based proxy runtime organized around the same major
+boundaries as sing-box: typed protocol registries, small inbound/outbound
+interfaces, staged lifecycle management, dependency-aware outbounds, and
+protocol implementations that live outside the core runtime.
+
+This repository is an initial working implementation, not yet a feature-for-
+feature replacement for sing-box.
+
+## What works
+
+- extensible inbound and outbound factory registries
+- two-pass JSON decoding based on each component's `type`
+- four-stage service lifecycle and reverse-order shutdown
+- outbound dependency validation and cycle detection
+- TCP sessions, routing, and bidirectional relay
+- `direct` outbound
+- SOCKS5 CONNECT inbound
+- external Snell inbound/outbound adapter
+- Snell v4 client to v5 server authenticated TCP path
+- external Hysteria2 inbound/outbound adapter backed by `sing-quic-rs`
+- Hysteria2 HTTP/3 authentication and multiplexed TCP streams over QUIC
+- PEM and DER certificate loading for Hysteria2
+- executable client and server configurations
+
+## Project layout
+
+```text
+crates/
+  sing-box-core/             protocol-neutral API and runtime
+  sing-box-protocol-snell/   thin adapter around sing-snell-rs
+  sing-box-protocol-hysteria2/ thin adapter around sing-quic-rs
+  sing-box-cli/              composition root and executable
+```
+
+The Snell wire implementation is a sibling project and is consumed through a
+path dependency:
+
+```text
+../sing-snell-rs
+../sing-quic-rs
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the extension contract.
+
+## Run
+
+Start the server:
+
+```bash
+cargo run -p sing-box-rs -- run -c examples/server.json
+```
+
+After adjusting the server address and credentials, start the client in a
+second terminal:
+
+```bash
+cargo run -p sing-box-rs -- run -c examples/client.json
+```
+
+The example client exposes a SOCKS5 proxy at `127.0.0.1:1080`.
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+```
+
+For the Hysteria2 examples, first create a development certificate:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout examples/hysteria2-key.pem \
+  -out examples/hysteria2-cert.pem \
+  -days 3650 -subj '/CN=localhost' \
+  -addext 'subjectAltName=DNS:localhost'
+```
+
+Then run `examples/hysteria2-server.json` and
+`examples/hysteria2-client.json` in separate terminals.
+
+Set `RUST_LOG=debug` to inspect routing and handshake failures.
+
+## Configuration
+
+Protocol options are flattened next to `type` and `tag`, matching sing-box's
+configuration shape. The registry first reads the component header and then
+deserializes the remaining JSON into the protocol crate's own option type.
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "local",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final_outbound": "direct"
+  }
+}
+```
+
+## Current limitations
+
+- proxied sessions are TCP only; Hysteria2 uses UDP as its QUIC transport
+- one final outbound route; rule matching and sniffing are not implemented
+- no DNS subsystem, TUN endpoint, endpoint registry, or service registry
+- no hot reload or connection tracking
+- SOCKS authentication and BIND/UDP ASSOCIATE are not implemented
+- Snell limitations are documented in the sibling project's README
+- Hysteria2 UDP forwarding, obfuscation, bandwidth negotiation, port hopping,
+  TUIC, and legacy Hysteria are not implemented yet
+
+## Verification
+
+The integration test starts an echo server and two proxy engines, then sends a
+real SOCKS5 connection through Snell and direct routing:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```

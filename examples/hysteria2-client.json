@@ -1,0 +1,27 @@
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-out",
+      "server": "127.0.0.1",
+      "server_port": 8443,
+      "password": "change-this-password",
+      "tls": {
+        "server_name": "localhost",
+        "certificate_path": "examples/hysteria2-cert.pem"
+      }
+    }
+  ],
+  "route": {
+    "final_outbound": "hy2-out"
+  }
+}
+

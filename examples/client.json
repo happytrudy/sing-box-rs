@@ -1,0 +1,25 @@
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-out",
+      "server": "127.0.0.1",
+      "server_port": 8388,
+      "version": 4,
+      "psk": "change-this-password",
+      "user_key": "change-this-user-key"
+    }
+  ],
+  "route": {
+    "final_outbound": "snell-out"
+  }
+}
+
