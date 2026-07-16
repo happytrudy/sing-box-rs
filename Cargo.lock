@@ -1116,6 +1116,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "quinn",
+ "quinn-proto",
  "rand 0.8.7",
  "rustls",
  "thiserror",

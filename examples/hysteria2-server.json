@@ -3,8 +3,10 @@
     {
       "type": "hysteria2",
       "tag": "hy2-in",
-      "listen": "0.0.0.0",
+      "listen": "::",
       "listen_port": 8443,
+      "up_mbps": 100,
+      "down_mbps": 100,
       "tls": {
         "certificate_path": "examples/hysteria2-cert.pem",
         "key_path": "examples/hysteria2-key.pem"
@@ -27,4 +29,3 @@
     "final_outbound": "direct"
   }
 }
-

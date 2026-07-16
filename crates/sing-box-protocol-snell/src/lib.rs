@@ -9,13 +9,13 @@ use serde::Deserialize;
 use sing_box_core::{
     Address, BoxPacketConnection, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle,
     Network, Outbound, OutboundBuildContext, OutboundManagerDialer, Packet, PacketConnection,
-    Registry, Router, Session, StartStage, SystemDialer,
+    Registry, Router, Session, StartStage, SystemDialer, bind_tcp_listeners,
 };
 use sing_snell::{
     AcceptedSession, Address as SnellAddress, Client, ClientOptions, ObfsMode, ObfsOptions,
     ReuseClientSession, Server, ServerOptions, User, V6Mode,
 };
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -154,6 +154,7 @@ impl PacketConnection for SnellPacketConnection {
 struct SnellInboundOptions {
     #[serde(default = "default_listen")]
     listen: String,
+    #[serde(default)]
     listen_port: u16,
     psk: String,
     #[serde(default = "default_server_version")]
@@ -185,7 +186,7 @@ struct SnellUserOptions {
 
 struct Running {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 struct SnellInbound {
@@ -207,58 +208,61 @@ impl Lifecycle for SnellInbound {
         if self.running.lock().await.is_some() {
             return Ok(());
         }
-        let listener = TcpListener::bind((self.listen.as_str(), self.listen_port))
+        let listeners = bind_tcp_listeners(&self.listen, self.listen_port)
             .await
             .context("bind Snell inbound")?;
-        let local_addr = listener.local_addr()?;
+        let local_addr = listeners[0].local_addr()?;
         *self.local_addr.write().expect("Snell address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
-        let task_cancel = cancel.clone();
-        let router = Arc::clone(&self.router);
-        let tag = self.tag.clone();
-        let server = self.server.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = task_cancel.cancelled() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok((stream, source)) => {
-                            let router = Arc::clone(&router);
-                            let server = server.clone();
-                            let tag = tag.clone();
-                            tokio::spawn(async move {
-                                let mut sessions = server.accept_sessions(stream);
-                                while let Some(accepted) = sessions.recv().await {
-                                    match accepted {
-                                        Ok(accepted) => {
-                                            if let Err(error) = route_accepted(
-                                                accepted,
-                                                source,
-                                                tag.clone(),
-                                                Arc::clone(&router),
-                                            )
-                                            .await
-                                            {
-                                                tracing::debug!(%source, %error, "Snell session closed");
+        let mut tasks = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let task_cancel = cancel.clone();
+            let router = Arc::clone(&self.router);
+            let tag = self.tag.clone();
+            let server = self.server.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = task_cancel.cancelled() => break,
+                        accepted = listener.accept() => match accepted {
+                            Ok((stream, source)) => {
+                                let router = Arc::clone(&router);
+                                let server = server.clone();
+                                let tag = tag.clone();
+                                tokio::spawn(async move {
+                                    let mut sessions = server.accept_sessions(stream);
+                                    while let Some(accepted) = sessions.recv().await {
+                                        match accepted {
+                                            Ok(accepted) => {
+                                                if let Err(error) = route_accepted(
+                                                    accepted,
+                                                    source,
+                                                    tag.clone(),
+                                                    Arc::clone(&router),
+                                                )
+                                                .await
+                                                {
+                                                    tracing::debug!(%source, %error, "Snell session closed");
+                                                }
+                                            }
+                                            Err(error) => {
+                                                tracing::debug!(%source, %error, "Snell handshake failed");
+                                                break;
                                             }
                                         }
-                                        Err(error) => {
-                                            tracing::debug!(%source, %error, "Snell handshake failed");
-                                            break;
-                                        }
                                     }
-                                }
-                            });
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "Snell accept failed");
-                            break;
+                                });
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "Snell accept failed");
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        });
-        *self.running.lock().await = Some(Running { cancel, task });
+            }));
+        }
+        *self.running.lock().await = Some(Running { cancel, tasks });
         tracing::info!(tag = %self.tag, %local_addr, "started Snell inbound");
         Ok(())
     }
@@ -266,7 +270,9 @@ impl Lifecycle for SnellInbound {
     async fn close(&self) -> Result<()> {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.cancel();
-            running.task.await?;
+            for task in running.tasks {
+                task.await?;
+            }
         }
         Ok(())
     }

@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod direct;
 mod engine;
+mod listen;
 mod manager;
 mod registry;
 mod router;
@@ -13,6 +14,7 @@ pub use api::{
 };
 pub use config::{Config, RawComponent, RouteConfig};
 pub use engine::Engine;
+pub use listen::{bind_tcp_listeners, listen_addresses};
 pub use manager::{InboundManager, OutboundManager, OutboundManagerDialer};
 pub use registry::{InboundBuildContext, OutboundBuildContext, Registry};
 pub use router::Router;

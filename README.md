@@ -22,6 +22,7 @@ feature replacement for sing-box.
 - Snell authenticated TCP, UDP, connection reuse, replay protection, and obfs
 - external Hysteria2 inbound/outbound adapter backed by `sing-quic-rs`
 - Hysteria2 HTTP/3 authentication and multiplexed TCP streams over QUIC
+- Hysteria2 BBR default and negotiated Brutal congestion control
 - PEM and DER certificate loading for Hysteria2
 - executable client and server configurations
 
@@ -79,6 +80,17 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 Then run `examples/hysteria2-server.json` and
 `examples/hysteria2-client.json` in separate terminals.
 
+Inbound `listen` semantics are shared by every protocol: `0.0.0.0` is
+IPv4-only, `::` listens on all IPv6 and IPv4 interfaces, and `::1` binds both
+the IPv6 and IPv4 loopback addresses. A full endpoint such as
+`127.0.0.1:443` or `[::1]:443` may be used instead of a separate
+`listen_port`.
+
+Hysteria2 `up_mbps` and `down_mbps` configure the local send and receive
+limits. Positive negotiated rates use Brutal; leaving both at zero keeps BBR.
+When server bandwidth is unset, `ignore_client_bandwidth` forces BBR. When it
+is set, the option rejects clients that request BBR, matching sing-box.
+
 Set `RUST_LOG=debug` to inspect routing and handshake failures.
 
 ## Configuration
@@ -120,8 +132,8 @@ value of `"http"` or `"tls"` plus an optional `"obfs_host"`.
 - no DNS subsystem, TUN endpoint, endpoint registry, or service registry
 - no hot reload or connection tracking
 - SOCKS authentication and BIND are not implemented
-- Hysteria2 UDP forwarding, obfuscation, bandwidth negotiation, port hopping,
-  TUIC, and legacy Hysteria are not implemented yet
+- Hysteria2 UDP forwarding, obfuscation, port hopping, TUIC, and legacy
+  Hysteria are not implemented yet
 
 ## Verification
 

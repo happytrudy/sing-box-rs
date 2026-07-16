@@ -78,6 +78,27 @@ Wire logic should remain in a separate reusable library. The adapter should
 only translate configuration and connect the library to listeners, dialers,
 sessions, routing, logging, and lifecycle management.
 
+## Inbound listen addresses
+
+Every inbound protocol must accept both IPv4 and IPv6 address literals in its
+`listen` field. The canonical form keeps the port in `listen_port`, but a full
+endpoint such as `listen: "127.0.0.1:443"` or `listen: "[::1]:443"` is also
+accepted. Build socket addresses structurally; never concatenate
+`host + ":" + port`, since that produces invalid unbracketed IPv6 addresses.
+
+The address meanings are consistent across protocols:
+
+- `0.0.0.0` listens on all IPv4 interfaces only.
+- A specific IPv4 address listens on that IPv4 interface only.
+- `::` listens on all IPv6 and IPv4 interfaces. This uses one IPv4-mapped IPv6
+  socket when supported, otherwise paired IPv6 and IPv4 wildcard sockets.
+- `::1` creates both `[::1]:listen_port` and
+  `127.0.0.1:listen_port`, covering both local loopback families.
+- A specific non-loopback IPv6 address listens on that IPv6 interface only.
+
+Protocol tests should cover the address expansion and, where the platform
+supports dual stack, connections through both `127.0.0.1` and `::1`.
+
 ## Dependency and lifecycle rules
 
 An outbound declares detours through `dependencies()`. The manager validates

@@ -37,8 +37,10 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
         "inbounds": [{
             "type": "hysteria2",
             "tag": "hy2-in",
-            "listen": "127.0.0.1",
+            "listen": "::1",
             "listen_port": 0,
+            "up_mbps": 100,
+            "down_mbps": 100,
             "tls": {
                 "certificate_path": certificate_path,
                 "key_path": private_key_path
@@ -56,15 +58,17 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
         "inbounds": [{
             "type": "socks",
             "tag": "socks-in",
-            "listen": "127.0.0.1",
+            "listen": "::1",
             "listen_port": 0
         }],
         "outbounds": [{
             "type": "hysteria2",
             "tag": "hy2-out",
-            "server": hysteria2_addr.ip().to_string(),
+            "server": "127.0.0.1",
             "server_port": hysteria2_addr.port(),
             "password": "secret",
+            "up_mbps": 100,
+            "down_mbps": 100,
             "tls": {
                 "server_name": "localhost",
                 "certificate_path": certificate_path
@@ -74,7 +78,8 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
     }))?;
     let client = Engine::new(client_config, registry).await?;
     client.start().await?;
-    let socks_addr = client.inbound_addr("socks-in").await.unwrap();
+    let socks_port = client.inbound_addr("socks-in").await.unwrap().port();
+    let socks_addr = (Ipv4Addr::LOCALHOST, socks_port);
 
     let mut stream = TcpStream::connect(socks_addr).await?;
     stream.write_all(&[5, 1, 0]).await?;

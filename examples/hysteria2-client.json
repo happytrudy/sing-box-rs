@@ -14,6 +14,8 @@
       "server": "127.0.0.1",
       "server_port": 8443,
       "password": "change-this-password",
+      "up_mbps": 100,
+      "down_mbps": 100,
       "tls": {
         "server_name": "localhost",
         "certificate_path": "examples/hysteria2-cert.pem"
@@ -24,4 +26,3 @@
     "final_outbound": "hy2-out"
   }
 }
-

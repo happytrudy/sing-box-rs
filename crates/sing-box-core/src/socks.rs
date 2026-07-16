@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     sync::Mutex,
     task::JoinHandle,
 };
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Address, Inbound, InboundBuildContext, Lifecycle, Network, Packet, PacketConnection, Registry,
-    Router, Session, StartStage,
+    Router, Session, StartStage, bind_tcp_listeners,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -24,6 +24,7 @@ use crate::{
 struct SocksOptions {
     #[serde(default = "default_listen")]
     listen: String,
+    #[serde(default)]
     listen_port: u16,
 }
 
@@ -33,7 +34,7 @@ fn default_listen() -> String {
 
 struct Running {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 struct SocksInbound {
@@ -53,38 +54,41 @@ impl Lifecycle for SocksInbound {
         if self.running.lock().await.is_some() {
             return Ok(());
         }
-        let listener = TcpListener::bind((self.options.listen.as_str(), self.options.listen_port))
+        let listeners = bind_tcp_listeners(&self.options.listen, self.options.listen_port)
             .await
             .context("bind SOCKS inbound")?;
-        let local_addr = listener.local_addr()?;
+        let local_addr = listeners[0].local_addr()?;
         *self.local_addr.write().expect("SOCKS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
-        let task_cancel = cancel.clone();
-        let router = Arc::clone(&self.router);
-        let tag = self.tag.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = task_cancel.cancelled() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok((stream, source)) => {
-                            let router = Arc::clone(&router);
-                            let tag = tag.clone();
-                            tokio::spawn(async move {
-                                if let Err(error) = handle_connection(stream, source, tag, router).await {
-                                    tracing::debug!(%source, %error, "SOCKS connection closed");
-                                }
-                            });
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "SOCKS accept failed");
-                            break;
+        let mut tasks = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let task_cancel = cancel.clone();
+            let router = Arc::clone(&self.router);
+            let tag = self.tag.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = task_cancel.cancelled() => break,
+                        accepted = listener.accept() => match accepted {
+                            Ok((stream, source)) => {
+                                let router = Arc::clone(&router);
+                                let tag = tag.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = handle_connection(stream, source, tag, router).await {
+                                        tracing::debug!(%source, %error, "SOCKS connection closed");
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "SOCKS accept failed");
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        });
-        *self.running.lock().await = Some(Running { cancel, task });
+            }));
+        }
+        *self.running.lock().await = Some(Running { cancel, tasks });
         tracing::info!(tag = %self.tag, %local_addr, "started SOCKS inbound");
         Ok(())
     }
@@ -92,7 +96,9 @@ impl Lifecycle for SocksInbound {
     async fn close(&self) -> Result<()> {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.cancel();
-            running.task.await?;
+            for task in running.tasks {
+                task.await?;
+            }
         }
         Ok(())
     }

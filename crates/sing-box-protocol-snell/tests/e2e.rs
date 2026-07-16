@@ -29,7 +29,7 @@ async fn socks_to_snell_to_direct_echo() -> Result<()> {
         "inbounds": [{
             "type": "snell",
             "tag": "snell-in",
-            "listen": "127.0.0.1",
+            "listen": "::1",
             "listen_port": 0,
             "version": 6,
             "mode": "default",
@@ -53,7 +53,7 @@ async fn socks_to_snell_to_direct_echo() -> Result<()> {
         "outbounds": [{
             "type": "snell",
             "tag": "snell-out",
-            "server": snell_addr.ip().to_string(),
+            "server": "127.0.0.1",
             "server_port": snell_addr.port(),
             "version": 6,
             "mode": "default",

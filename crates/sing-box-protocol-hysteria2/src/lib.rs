@@ -9,9 +9,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
     Address, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Outbound,
-    OutboundBuildContext, Registry, Router, Session, StartStage,
+    OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
 };
-use sing_quic::hysteria2::{Client, ClientOptions, Server, ServerOptions, User as Hysteria2User};
+use sing_quic::Error as SingQuicError;
+use sing_quic::hysteria2::{
+    Client, ClientBandwidth, ClientOptions, Server, ServerBandwidth, ServerOptions,
+    User as Hysteria2User,
+};
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +25,10 @@ struct Hysteria2OutboundOptions {
     server: String,
     server_port: u16,
     password: String,
+    #[serde(default)]
+    up_mbps: u64,
+    #[serde(default)]
+    down_mbps: u64,
     tls: OutboundTlsOptions,
 }
 
@@ -73,7 +81,14 @@ impl Outbound for Hysteria2Outbound {
 struct Hysteria2InboundOptions {
     #[serde(default = "default_listen")]
     listen: String,
+    #[serde(default)]
     listen_port: u16,
+    #[serde(default)]
+    up_mbps: u64,
+    #[serde(default)]
+    down_mbps: u64,
+    #[serde(default)]
+    ignore_client_bandwidth: bool,
     tls: InboundTlsOptions,
     users: Vec<UserOptions>,
 }
@@ -97,16 +112,17 @@ struct UserOptions {
 }
 
 struct PreparedServer {
-    listen: SocketAddr,
+    listen: Vec<SocketAddr>,
     certificate_chain: Vec<Vec<u8>>,
     private_key: Vec<u8>,
     users: Vec<Hysteria2User>,
+    bandwidth: ServerBandwidth,
 }
 
 struct Running {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
-    server: Arc<Server>,
+    tasks: Vec<JoinHandle<()>>,
+    servers: Vec<Arc<Server>>,
 }
 
 struct Hysteria2Inbound {
@@ -132,64 +148,67 @@ impl Lifecycle for Hysteria2Inbound {
             .await
             .take()
             .context("Hysteria2 inbound cannot be restarted after close")?;
-        let server = Arc::new(Server::bind(ServerOptions {
-            listen: prepared.listen,
-            certificate_chain: prepared.certificate_chain,
-            private_key: prepared.private_key,
-            users: prepared.users,
-        })?);
-        let local_addr = server.local_addr()?;
+        let PreparedServer {
+            listen,
+            certificate_chain,
+            private_key,
+            users,
+            bandwidth,
+        } = prepared;
+        let ipv6_wildcard = listen[0].ip().is_unspecified() && listen[0].is_ipv6();
+        let mut servers: Vec<Arc<Server>> = Vec::with_capacity(listen.len());
+        let mut assigned_port = 0;
+        for (index, mut address) in listen.into_iter().enumerate() {
+            if index > 0 && address.port() == 0 {
+                address.set_port(assigned_port);
+            }
+            let server = match Server::bind_with_bandwidth(
+                ServerOptions {
+                    listen: address,
+                    certificate_chain: certificate_chain.clone(),
+                    private_key: private_key.clone(),
+                    users: users.clone(),
+                },
+                bandwidth,
+            ) {
+                Ok(server) => Arc::new(server),
+                Err(SingQuicError::Io(error))
+                    if index > 0
+                        && ipv6_wildcard
+                        && error.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    for server in &servers {
+                        server.close().await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            if index == 0 {
+                assigned_port = server.local_addr()?.port();
+            }
+            servers.push(server);
+        }
+        let local_addr = servers[0].local_addr()?;
         *self.local_addr.write().expect("Hysteria2 address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
-        let task_cancel = cancel.clone();
-        let task_server = Arc::clone(&server);
-        let router = Arc::clone(&self.router);
-        let tag = self.tag.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = task_cancel.cancelled() => break,
-                    accepted = task_server.accept() => match accepted {
-                        Ok(accepted) => {
-                            let router = Arc::clone(&router);
-                            let tag = tag.clone();
-                            tokio::spawn(async move {
-                                let destination = match Address::new(
-                                    accepted.destination.host(),
-                                    accepted.destination.port(),
-                                ) {
-                                    Ok(destination) => destination,
-                                    Err(error) => {
-                                        tracing::debug!(%error, "invalid Hysteria2 destination");
-                                        return;
-                                    }
-                                };
-                                let session = Session {
-                                    network: Network::Tcp,
-                                    source: Some(accepted.source),
-                                    destination,
-                                    inbound: tag,
-                                    inbound_type: "hysteria2".to_owned(),
-                                    outbound: None,
-                                    user: Some(accepted.user),
-                                };
-                                if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
-                                    tracing::debug!(%error, "Hysteria2 stream closed");
-                                }
-                            });
-                        }
-                        Err(error) => {
-                            tracing::debug!(%error, "Hysteria2 accept stopped");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        let tasks = servers
+            .iter()
+            .map(|server| {
+                tokio::spawn(run_server(
+                    Arc::clone(server),
+                    cancel.clone(),
+                    Arc::clone(&self.router),
+                    self.tag.clone(),
+                ))
+            })
+            .collect();
         *self.running.lock().await = Some(Running {
             cancel,
-            task,
-            server,
+            tasks,
+            servers,
         });
         tracing::info!(tag = %self.tag, %local_addr, "started Hysteria2 inbound");
         Ok(())
@@ -198,10 +217,61 @@ impl Lifecycle for Hysteria2Inbound {
     async fn close(&self) -> Result<()> {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.cancel();
-            running.task.await?;
-            running.server.close().await;
+            for task in running.tasks {
+                task.await?;
+            }
+            for server in running.servers {
+                server.close().await;
+            }
         }
         Ok(())
+    }
+}
+
+async fn run_server(
+    server: Arc<Server>,
+    cancel: CancellationToken,
+    router: Arc<Router>,
+    tag: String,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = server.accept() => match accepted {
+                Ok(accepted) => {
+                    let router = Arc::clone(&router);
+                    let tag = tag.clone();
+                    tokio::spawn(async move {
+                        let destination = match Address::new(
+                            accepted.destination.host(),
+                            accepted.destination.port(),
+                        ) {
+                            Ok(destination) => destination,
+                            Err(error) => {
+                                tracing::debug!(%error, "invalid Hysteria2 destination");
+                                return;
+                            }
+                        };
+                        let session = Session {
+                            network: Network::Tcp,
+                            source: Some(accepted.source),
+                            destination,
+                            inbound: tag,
+                            inbound_type: "hysteria2".to_owned(),
+                            outbound: None,
+                            user: Some(accepted.user),
+                        };
+                        if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
+                            tracing::debug!(%error, "Hysteria2 stream closed");
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Hysteria2 accept stopped");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -229,12 +299,18 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 .await
                 .with_context(|| format!("read {}", options.tls.certificate_path))?;
             let certificates = parse_certificates(&certificate_data)?;
-            let client = Client::new(ClientOptions {
-                server,
-                server_name: options.tls.server_name,
-                password: options.password,
-                ca_certificates: certificates,
-            })?;
+            let client = Client::new_with_bandwidth(
+                ClientOptions {
+                    server,
+                    server_name: options.tls.server_name,
+                    password: options.password,
+                    ca_certificates: certificates,
+                },
+                ClientBandwidth {
+                    send_bps: mbps_to_bps(options.up_mbps)?,
+                    receive_bps: mbps_to_bps(options.down_mbps)?,
+                },
+            )?;
             Ok(Arc::new(Hysteria2Outbound {
                 tag,
                 client: Arc::new(client),
@@ -246,9 +322,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         "hysteria2",
         |context: InboundBuildContext, tag, options| async move {
             anyhow::ensure!(!options.users.is_empty(), "Hysteria2 users cannot be empty");
-            let listen: SocketAddr = format!("{}:{}", options.listen, options.listen_port)
-                .parse()
-                .context("parse Hysteria2 listen address")?;
+            let listen = listen_addresses(&options.listen, options.listen_port)?;
             let certificate_data = tokio::fs::read(&options.tls.certificate_path)
                 .await
                 .with_context(|| format!("read {}", options.tls.certificate_path))?;
@@ -267,6 +341,11 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                         password: user.password,
                     })
                     .collect(),
+                bandwidth: ServerBandwidth {
+                    send_bps: mbps_to_bps(options.up_mbps)?,
+                    receive_bps: mbps_to_bps(options.down_mbps)?,
+                    ignore_client_bandwidth: options.ignore_client_bandwidth,
+                },
             };
             Ok(Arc::new(Hysteria2Inbound {
                 tag,
@@ -278,6 +357,11 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn mbps_to_bps(mbps: u64) -> Result<u64> {
+    mbps.checked_mul(125_000)
+        .context("Hysteria2 bandwidth is too large")
 }
 
 async fn resolve_server(host: &str, port: u16) -> Result<SocketAddr> {
