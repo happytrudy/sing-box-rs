@@ -1,8 +1,10 @@
-use std::{env, path::PathBuf};
+use std::env;
 
-use anyhow::{Context, Result};
-use sing_box_core::{Config, Engine, Registry, register_builtins};
+use anyhow::Result;
+use sing_box_core::{Engine, Registry, register_builtins};
 use tracing_subscriber::EnvFilter;
+
+mod config_loader;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,33 +12,29 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let config_path = config_path()?;
-    let content = tokio::fs::read_to_string(&config_path)
-        .await
-        .with_context(|| format!("read config {}", config_path.display()))?;
-    let config: Config = serde_json::from_str(&content)
-        .with_context(|| format!("decode config {}", config_path.display()))?;
+    let sources = match config_loader::parse_args(env::args().skip(1))? {
+        config_loader::CliAction::Run(sources) => sources,
+        config_loader::CliAction::Help => {
+            print!("{}", config_loader::HELP);
+            return Ok(());
+        }
+        config_loader::CliAction::Version => {
+            println!("sing-box-rs {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    };
+    let loaded = config_loader::load(sources).await?;
+    tracing::info!(files = loaded.paths.len(), "loaded configuration");
 
     let mut registry = Registry::new();
     register_builtins(&mut registry)?;
     sing_box_protocol_snell::register(&mut registry)?;
     sing_box_protocol_hysteria2::register(&mut registry)?;
 
-    let engine = Engine::new(config, registry).await?;
+    let engine = Engine::new(loaded.config, registry).await?;
     engine.start().await?;
     tracing::info!("sing-box-rs started");
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
     engine.shutdown().await
-}
-
-fn config_path() -> Result<PathBuf> {
-    let arguments: Vec<String> = env::args().skip(1).collect();
-    let index = usize::from(arguments.first().is_some_and(|item| item == "run"));
-    match &arguments[index..] {
-        [option, value] if option == "-c" || option == "--config" => Ok(PathBuf::from(value)),
-        [value] if !value.starts_with('-') => Ok(PathBuf::from(value)),
-        [option, ..] if option.starts_with('-') => anyhow::bail!("unknown option: {option}"),
-        _ => anyhow::bail!("usage: sing-box-rs run -c <config.json>"),
-    }
 }

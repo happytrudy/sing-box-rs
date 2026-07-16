@@ -80,6 +80,20 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 Then run `examples/hysteria2-server.json` and
 `examples/hysteria2-client.json` in separate terminals.
 
+The server can also be split into a base configuration and protocol-specific
+inbound fragments:
+
+```bash
+cargo run -p sing-box-rs -- run \
+  -c examples/modular/config.json \
+  -C examples/modular/conf
+```
+
+`-c` and `-C` are repeatable. The loader collects direct `.json` files from
+each directory, sorts all paths, recursively merges objects, and appends
+arrays. This keeps inbounds in independent files while outbounds and routing
+remain in the base configuration.
+
 Inbound `listen` semantics are shared by every protocol: `0.0.0.0` is
 IPv4-only, `::` listens on all IPv6 and IPv4 interfaces, and `::1` binds both
 the IPv6 and IPv4 loopback addresses. A full endpoint such as

@@ -49,6 +49,13 @@ Instead, configuration is decoded in two passes:
 The generic registration methods keep option decoding type-safe while storing
 object-safe factories internally.
 
+Configuration source composition happens in the CLI before this typed decode.
+`-c` adds a JSON file and `-C` adds the direct `.json` children of a directory;
+both flags are repeatable. All paths are sorted together. Objects merge
+recursively, arrays append in path order, and an earlier scalar value takes
+precedence. Each source may therefore be a partial document, but the final
+merged document must satisfy the strict `Config` schema.
+
 ## Composition root
 
 `sing-box-cli` creates a registry and explicitly installs modules:
