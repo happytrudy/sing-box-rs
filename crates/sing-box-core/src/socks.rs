@@ -8,15 +8,15 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Address, Inbound, InboundBuildContext, Lifecycle, Network, Registry, Router, Session,
-    StartStage,
+    Address, Inbound, InboundBuildContext, Lifecycle, Network, Packet, PacketConnection, Registry,
+    Router, Session, StartStage,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -132,11 +132,21 @@ async fn handle_connection(
 
     let mut request = [0u8; 4];
     stream.read_exact(&mut request).await?;
-    anyhow::ensure!(
-        request[0] == 5 && request[1] == 1,
-        "only SOCKS5 CONNECT is supported"
-    );
-    let host = match request[3] {
+    anyhow::ensure!(request[0] == 5 && request[2] == 0, "invalid SOCKS5 request");
+    let destination = read_address(&mut stream, request[3]).await?;
+
+    match request[1] {
+        1 => handle_connect(stream, source, tag, router, destination).await,
+        3 => handle_udp_associate(stream, source, tag, router, destination).await,
+        command => {
+            let _ = write_reply(&mut stream, 7, unspecified_address(source)).await;
+            anyhow::bail!("unsupported SOCKS5 command {command}")
+        }
+    }
+}
+
+async fn read_address(stream: &mut TcpStream, address_type: u8) -> Result<Address> {
+    let host = match address_type {
         1 => {
             let mut bytes = [0u8; 4];
             stream.read_exact(&mut bytes).await?;
@@ -153,13 +163,23 @@ async fn handle_connection(
             stream.read_exact(&mut bytes).await?;
             IpAddr::from(bytes).to_string()
         }
-        address_type => anyhow::bail!("unsupported SOCKS address type {address_type}"),
+        other => anyhow::bail!("unsupported SOCKS address type {other}"),
     };
     let port = stream.read_u16().await?;
+    Address::new(host, port)
+}
+
+async fn handle_connect(
+    mut stream: TcpStream,
+    source: SocketAddr,
+    tag: String,
+    router: Arc<Router>,
+    destination: Address,
+) -> Result<()> {
     let mut session = Session {
         network: Network::Tcp,
         source: Some(source),
-        destination: Address::new(host, port)?,
+        destination,
         inbound: tag,
         inbound_type: "socks".to_owned(),
         outbound: None,
@@ -168,19 +188,166 @@ async fn handle_connection(
 
     match router.connect(&mut session).await {
         Ok(outbound) => {
-            let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-            let mut reply = vec![5, 0, 0, 1];
-            if let IpAddr::V4(address) = bound.ip() {
-                reply.extend_from_slice(&address.octets());
-            }
-            reply.extend_from_slice(&bound.port().to_be_bytes());
-            stream.write_all(&reply).await?;
+            write_reply(&mut stream, 0, unspecified_address(source)).await?;
             router.relay(session, Box::new(stream), outbound).await
         }
         Err(error) => {
             let _ = stream.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await;
             Err(error)
         }
+    }
+}
+
+async fn handle_udp_associate(
+    mut stream: TcpStream,
+    source: SocketAddr,
+    tag: String,
+    router: Arc<Router>,
+    destination: Address,
+) -> Result<()> {
+    let local_ip = stream.local_addr()?.ip();
+    let socket = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
+    write_reply(&mut stream, 0, socket.local_addr()?).await?;
+    let connection = Arc::new(SocksPacketConnection {
+        socket,
+        control_source_ip: source.ip(),
+        peer: Mutex::new(None),
+    });
+    let session = Session {
+        network: Network::Udp,
+        source: Some(source),
+        destination,
+        inbound: tag,
+        inbound_type: "socks".to_owned(),
+        outbound: None,
+        user: None,
+    };
+
+    tokio::select! {
+        result = router.route_packet(session, connection) => result,
+        result = async {
+            let mut sink = tokio::io::sink();
+            tokio::io::copy(&mut stream, &mut sink).await?;
+            Ok::<(), anyhow::Error>(())
+        } => result,
+    }
+}
+
+struct SocksPacketConnection {
+    socket: Arc<UdpSocket>,
+    control_source_ip: IpAddr,
+    peer: Mutex<Option<SocketAddr>>,
+}
+
+#[async_trait]
+impl PacketConnection for SocksPacketConnection {
+    async fn send(&self, packet: Packet) -> Result<()> {
+        let peer = self
+            .peer
+            .lock()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("SOCKS UDP client address is not known"))?;
+        let mut output = vec![0, 0, 0];
+        encode_address(&packet.destination, &mut output)?;
+        output.extend_from_slice(&packet.data);
+        self.socket.send_to(&output, peer).await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Packet> {
+        let mut buffer = vec![0u8; u16::MAX as usize];
+        loop {
+            let (length, source) = self.socket.recv_from(&mut buffer).await?;
+            if source.ip() != self.control_source_ip {
+                continue;
+            }
+            let current_peer = *self.peer.lock().await;
+            if current_peer.is_some_and(|peer| peer != source) {
+                continue;
+            }
+            anyhow::ensure!(length >= 4, "truncated SOCKS UDP datagram");
+            anyhow::ensure!(buffer[0..2] == [0, 0], "invalid SOCKS UDP reserved bytes");
+            anyhow::ensure!(buffer[2] == 0, "fragmented SOCKS UDP is not supported");
+            let (destination, consumed) = decode_address(&buffer[3..length])?;
+            *self.peer.lock().await = Some(source);
+            return Ok(Packet {
+                data: buffer[3 + consumed..length].to_vec(),
+                destination,
+            });
+        }
+    }
+}
+
+async fn write_reply(stream: &mut TcpStream, status: u8, bound: SocketAddr) -> Result<()> {
+    let mut reply = vec![5, status, 0];
+    encode_address(
+        &Address::new(bound.ip().to_string(), bound.port())?,
+        &mut reply,
+    )?;
+    stream.write_all(&reply).await?;
+    Ok(())
+}
+
+fn encode_address(address: &Address, output: &mut Vec<u8>) -> Result<()> {
+    match address.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            output.push(1);
+            output.extend_from_slice(&ip.octets());
+        }
+        Ok(IpAddr::V6(ip)) => {
+            output.push(4);
+            output.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            anyhow::ensure!(
+                address.host.len() <= u8::MAX as usize,
+                "SOCKS host is too long"
+            );
+            output.push(3);
+            output.push(address.host.len() as u8);
+            output.extend_from_slice(address.host.as_bytes());
+        }
+    }
+    output.extend_from_slice(&address.port.to_be_bytes());
+    Ok(())
+}
+
+fn decode_address(input: &[u8]) -> Result<(Address, usize)> {
+    anyhow::ensure!(!input.is_empty(), "missing SOCKS UDP address");
+    let (host, address_len) = match input[0] {
+        1 => {
+            anyhow::ensure!(input.len() >= 7, "truncated SOCKS IPv4 address");
+            (
+                IpAddr::from([input[1], input[2], input[3], input[4]]).to_string(),
+                5,
+            )
+        }
+        4 => {
+            anyhow::ensure!(input.len() >= 19, "truncated SOCKS IPv6 address");
+            let bytes: [u8; 16] = input[1..17].try_into().expect("IPv6 length checked");
+            (IpAddr::from(bytes).to_string(), 17)
+        }
+        3 => {
+            anyhow::ensure!(input.len() >= 2, "truncated SOCKS domain length");
+            let length = input[1] as usize;
+            anyhow::ensure!(input.len() >= 2 + length + 2, "truncated SOCKS domain");
+            (
+                String::from_utf8(input[2..2 + length].to_vec())
+                    .context("SOCKS domain is not UTF-8")?,
+                2 + length,
+            )
+        }
+        other => anyhow::bail!("unsupported SOCKS address type {other}"),
+    };
+    anyhow::ensure!(input.len() >= address_len + 2, "missing SOCKS port");
+    let port = u16::from_be_bytes([input[address_len], input[address_len + 1]]);
+    Ok((Address::new(host, port)?, address_len + 2))
+}
+
+fn unspecified_address(source: SocketAddr) -> SocketAddr {
+    match source {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
     }
 }
 

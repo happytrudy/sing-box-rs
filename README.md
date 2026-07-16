@@ -14,11 +14,12 @@ feature replacement for sing-box.
 - two-pass JSON decoding based on each component's `type`
 - four-stage service lifecycle and reverse-order shutdown
 - outbound dependency validation and cycle detection
-- TCP sessions, routing, and bidirectional relay
-- `direct` outbound
-- SOCKS5 CONNECT inbound
+- TCP and UDP sessions, routing, and bidirectional relay
+- TCP/UDP `direct` outbound with IPv4 and IPv6 sockets
+- SOCKS5 CONNECT and UDP ASSOCIATE inbound
 - external Snell inbound/outbound adapter
-- Snell v4 client to v5 server authenticated TCP path
+- Snell v4/v5 legacy and v6 default/unshaped/unsafe-raw modes
+- Snell authenticated TCP, UDP, connection reuse, replay protection, and obfs
 - external Hysteria2 inbound/outbound adapter backed by `sing-quic-rs`
 - Hysteria2 HTTP/3 authentication and multiplexed TCP streams over QUIC
 - PEM and DER certificate loading for Hysteria2
@@ -108,21 +109,24 @@ deserializes the remaining JSON into the protocol crate's own option type.
 }
 ```
 
+Snell v6 outbound options use `"version": 6` and optionally
+`"mode": "default"`, `"unshaped"`, or `"unsafe-raw"`. Set `"reuse": true`
+to pool CONNECT_V2 sessions. Both Snell inbound and outbound accept an `"obfs"`
+value of `"http"` or `"tls"` plus an optional `"obfs_host"`.
+
 ## Current limitations
 
-- proxied sessions are TCP only; Hysteria2 uses UDP as its QUIC transport
 - one final outbound route; rule matching and sniffing are not implemented
 - no DNS subsystem, TUN endpoint, endpoint registry, or service registry
 - no hot reload or connection tracking
-- SOCKS authentication and BIND/UDP ASSOCIATE are not implemented
-- Snell limitations are documented in the sibling project's README
+- SOCKS authentication and BIND are not implemented
 - Hysteria2 UDP forwarding, obfuscation, bandwidth negotiation, port hopping,
   TUIC, and legacy Hysteria are not implemented yet
 
 ## Verification
 
-The integration test starts an echo server and two proxy engines, then sends a
-real SOCKS5 connection through Snell and direct routing:
+The integration tests start TCP/UDP echo servers and two proxy engines, then
+exercise SOCKS5 TCP reuse and UDP ASSOCIATE through Snell and direct routing:
 
 ```bash
 cargo test --workspace

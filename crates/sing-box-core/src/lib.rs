@@ -8,8 +8,8 @@ mod router;
 mod socks;
 
 pub use api::{
-    Address, BoxStream, Dialer, Inbound, Lifecycle, Network, Outbound, ProxyStream, START_STAGES,
-    Session, StartStage, SystemDialer,
+    Address, BoxPacketConnection, BoxStream, Dialer, Inbound, Lifecycle, Network, Outbound, Packet,
+    PacketConnection, ProxyStream, START_STAGES, Session, StartStage, SystemDialer,
 };
 pub use config::{Config, RawComponent, RouteConfig};
 pub use engine::Engine;

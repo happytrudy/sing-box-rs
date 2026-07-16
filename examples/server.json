@@ -5,7 +5,8 @@
       "tag": "snell-in",
       "listen": "0.0.0.0",
       "listen_port": 8388,
-      "version": 5,
+      "version": 6,
+      "mode": "default",
       "psk": "change-this-password",
       "users": [
         {
@@ -25,4 +26,3 @@
     "final_outbound": "direct"
   }
 }
-

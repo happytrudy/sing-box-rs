@@ -1,4 +1,4 @@
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +13,20 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn ProxyStream>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Packet {
+    pub data: Vec<u8>,
+    pub destination: Address,
+}
+
+#[async_trait]
+pub trait PacketConnection: Send + Sync {
+    async fn send(&self, packet: Packet) -> Result<()>;
+    async fn recv(&self) -> Result<Packet>;
+}
+
+pub type BoxPacketConnection = Arc<dyn PacketConnection>;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Address {
@@ -107,6 +121,10 @@ pub trait Outbound: Lifecycle + Dialer {
 
     fn dependencies(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    async fn connect_packet(&self, _session: &Session) -> Result<BoxPacketConnection> {
+        anyhow::bail!("outbound {} does not support UDP", self.tag())
     }
 }
 

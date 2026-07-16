@@ -13,7 +13,9 @@
       "tag": "snell-out",
       "server": "127.0.0.1",
       "server_port": 8388,
-      "version": 4,
+      "version": 6,
+      "mode": "default",
+      "reuse": true,
       "psk": "change-this-password",
       "user_key": "change-this-user-key"
     }
@@ -22,4 +24,3 @@
     "final_outbound": "snell-out"
   }
 }
-

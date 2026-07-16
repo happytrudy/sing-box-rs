@@ -7,11 +7,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
-    Address, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Outbound,
-    OutboundBuildContext, OutboundManagerDialer, Registry, Router, Session, StartStage,
-    SystemDialer,
+    Address, BoxPacketConnection, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle,
+    Network, Outbound, OutboundBuildContext, OutboundManagerDialer, Packet, PacketConnection,
+    Registry, Router, Session, StartStage, SystemDialer,
 };
-use sing_snell::{Address as SnellAddress, Client, ClientOptions, Server, ServerOptions, User};
+use sing_snell::{
+    AcceptedSession, Address as SnellAddress, Client, ClientOptions, ObfsMode, ObfsOptions,
+    ReuseClientSession, Server, ServerOptions, User, V6Mode,
+};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +30,14 @@ struct SnellOutboundOptions {
     version: u8,
     #[serde(default)]
     detour: String,
+    #[serde(default)]
+    obfs: String,
+    #[serde(default)]
+    obfs_host: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    reuse: bool,
 }
 
 fn default_client_version() -> u8 {
@@ -39,22 +50,53 @@ struct SnellOutbound {
     client: Client,
     dialer: Arc<dyn Dialer>,
     dependencies: Vec<String>,
+    reuse: bool,
+    reuse_sessions: Mutex<Vec<ReuseClientSession>>,
 }
 
-impl Lifecycle for SnellOutbound {}
+#[async_trait]
+impl Lifecycle for SnellOutbound {
+    async fn close(&self) -> Result<()> {
+        for session in self.reuse_sessions.lock().await.drain(..) {
+            session.close().await;
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Dialer for SnellOutbound {
     async fn connect(&self, session: &Session) -> Result<BoxStream> {
-        anyhow::ensure!(
-            session.network == Network::Tcp,
-            "Snell UDP is not implemented"
-        );
-        let transport_session = Session::outbound(self.server.clone());
-        let transport = self.dialer.connect(&transport_session).await?;
+        anyhow::ensure!(session.network == Network::Tcp, "expected a TCP session");
         let destination =
             SnellAddress::new(session.destination.host.clone(), session.destination.port)?;
+        if self.reuse {
+            return self.connect_reuse(destination).await;
+        }
+        let transport_session = Session::outbound(self.server.clone());
+        let transport = self.dialer.connect(&transport_session).await?;
         let stream = self.client.connect(transport, destination).await?;
+        Ok(Box::new(stream))
+    }
+}
+
+impl SnellOutbound {
+    async fn connect_reuse(&self, destination: SnellAddress) -> Result<BoxStream> {
+        let mut sessions = self.reuse_sessions.lock().await;
+        sessions.retain(|session| !session.is_closed());
+        if let Some(session) = sessions.iter().find(|session| !session.is_busy()) {
+            return session
+                .connect(destination)
+                .await
+                .map(|stream| Box::new(stream) as BoxStream)
+                .map_err(Into::into);
+        }
+
+        let transport_session = Session::outbound(self.server.clone());
+        let transport = self.dialer.connect(&transport_session).await?;
+        let session = self.client.reuse_session(transport)?;
+        let stream = session.connect(destination).await?;
+        sessions.push(session);
         Ok(Box::new(stream))
     }
 }
@@ -72,6 +114,39 @@ impl Outbound for SnellOutbound {
     fn dependencies(&self) -> Vec<String> {
         self.dependencies.clone()
     }
+
+    async fn connect_packet(&self, session: &Session) -> Result<BoxPacketConnection> {
+        anyhow::ensure!(session.network == Network::Udp, "expected a UDP session");
+        let transport_session = Session::outbound(self.server.clone());
+        let transport = self.dialer.connect(&transport_session).await?;
+        let connection = self.client.connect_udp(transport).await?;
+        Ok(Arc::new(SnellPacketConnection { inner: connection }))
+    }
+}
+
+struct SnellPacketConnection {
+    inner: sing_snell::PacketConnection,
+}
+
+#[async_trait]
+impl PacketConnection for SnellPacketConnection {
+    async fn send(&self, packet: Packet) -> Result<()> {
+        self.inner
+            .send(
+                packet.data,
+                SnellAddress::new(packet.destination.host, packet.destination.port)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Packet> {
+        let packet = self.inner.recv().await?;
+        Ok(Packet {
+            data: packet.data,
+            destination: Address::new(packet.destination.host(), packet.destination.port())?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,6 +160,12 @@ struct SnellInboundOptions {
     version: u8,
     #[serde(default)]
     users: Vec<SnellUserOptions>,
+    #[serde(default)]
+    obfs: String,
+    #[serde(default)]
+    obfs_host: String,
+    #[serde(default)]
+    mode: String,
 }
 
 fn default_listen() -> String {
@@ -146,32 +227,26 @@ impl Lifecycle for SnellInbound {
                             let server = server.clone();
                             let tag = tag.clone();
                             tokio::spawn(async move {
-                                match server.accept(stream).await {
-                                    Ok(accepted) => {
-                                        let destination = match Address::new(
-                                            accepted.destination.host(),
-                                            accepted.destination.port(),
-                                        ) {
-                                            Ok(destination) => destination,
-                                            Err(error) => {
-                                                tracing::debug!(%source, %error, "invalid Snell destination");
-                                                return;
+                                let mut sessions = server.accept_sessions(stream);
+                                while let Some(accepted) = sessions.recv().await {
+                                    match accepted {
+                                        Ok(accepted) => {
+                                            if let Err(error) = route_accepted(
+                                                accepted,
+                                                source,
+                                                tag.clone(),
+                                                Arc::clone(&router),
+                                            )
+                                            .await
+                                            {
+                                                tracing::debug!(%source, %error, "Snell session closed");
                                             }
-                                        };
-                                        let session = Session {
-                                            network: Network::Tcp,
-                                            source: Some(source),
-                                            destination,
-                                            inbound: tag,
-                                            inbound_type: "snell".to_owned(),
-                                            outbound: None,
-                                            user: accepted.user,
-                                        };
-                                        if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
-                                            tracing::debug!(%source, %error, "Snell connection closed");
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!(%source, %error, "Snell handshake failed");
+                                            break;
                                         }
                                     }
-                                    Err(error) => tracing::debug!(%source, %error, "Snell handshake failed"),
                                 }
                             });
                         }
@@ -197,6 +272,50 @@ impl Lifecycle for SnellInbound {
     }
 }
 
+async fn route_accepted(
+    accepted: AcceptedSession,
+    source: SocketAddr,
+    tag: String,
+    router: Arc<Router>,
+) -> Result<()> {
+    match accepted {
+        AcceptedSession::Stream(accepted) => {
+            let destination =
+                Address::new(accepted.destination.host(), accepted.destination.port())?;
+            let session = Session {
+                network: Network::Tcp,
+                source: Some(source),
+                destination,
+                inbound: tag,
+                inbound_type: "snell".to_owned(),
+                outbound: None,
+                user: accepted.user,
+            };
+            router.route(session, Box::new(accepted.stream)).await
+        }
+        AcceptedSession::Packet(accepted) => {
+            let session = Session {
+                network: Network::Udp,
+                source: Some(source),
+                destination: Address::new("0.0.0.0", 0)?,
+                inbound: tag,
+                inbound_type: "snell".to_owned(),
+                outbound: None,
+                user: accepted.user,
+            };
+            router
+                .route_packet(
+                    session,
+                    Arc::new(SnellPacketConnection {
+                        inner: accepted.connection,
+                    }),
+                )
+                .await
+        }
+        AcceptedSession::Pong => Ok(()),
+    }
+}
+
 #[async_trait]
 impl Inbound for SnellInbound {
     fn kind(&self) -> &'static str {
@@ -217,15 +336,22 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         "snell",
         |context: OutboundBuildContext, tag, options| async move {
             anyhow::ensure!(
-                options.version == 4,
-                "sing-snell-rs currently supports Snell v4 outbound, got v{}",
+                options.version == 4 || options.version == 6,
+                "Snell outbound version must be 4 or 6, got v{}",
                 options.version
             );
             let server = Address::new(options.server, options.server_port)?;
-            let client = Client::new(ClientOptions {
+            let obfs = parse_obfs(&options.obfs, options.obfs_host)?;
+            let mut client = Client::new(ClientOptions {
                 psk: options.psk.into_bytes(),
                 user_key: options.user_key.into_bytes(),
-            })?;
+            })?
+            .with_obfs(obfs);
+            if options.version == 6 {
+                client = client.with_v6_mode(parse_v6_mode(&options.mode)?)?;
+            } else {
+                anyhow::ensure!(options.mode.is_empty(), "Snell mode requires version 6");
+            }
             let (dialer, dependencies): (Arc<dyn Dialer>, Vec<String>) =
                 if options.detour.is_empty() {
                     (Arc::new(SystemDialer), Vec::new())
@@ -244,6 +370,8 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 client,
                 dialer,
                 dependencies,
+                reuse: options.reuse,
+                reuse_sessions: Mutex::new(Vec::new()),
             }) as Arc<dyn Outbound>)
         },
     )?;
@@ -252,8 +380,8 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         "snell",
         |context: InboundBuildContext, tag, options| async move {
             anyhow::ensure!(
-                options.version == 5,
-                "sing-snell-rs currently supports Snell v5 inbound, got v{}",
+                options.version == 5 || options.version == 6,
+                "Snell inbound version must be 5 or 6, got v{}",
                 options.version
             );
             let users = options
@@ -264,10 +392,17 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     key: user.user_key.into_bytes(),
                 })
                 .collect();
-            let server = Server::new(ServerOptions {
+            let obfs = parse_obfs(&options.obfs, options.obfs_host)?;
+            let mut server = Server::new(ServerOptions {
                 psk: options.psk.into_bytes(),
                 users,
-            })?;
+            })?
+            .with_obfs(obfs);
+            if options.version == 6 {
+                server = server.with_v6_mode(parse_v6_mode(&options.mode)?)?;
+            } else {
+                anyhow::ensure!(options.mode.is_empty(), "Snell mode requires version 6");
+            }
             Ok(Arc::new(SnellInbound {
                 tag,
                 listen: options.listen,
@@ -280,4 +415,23 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn parse_obfs(mode: &str, host: String) -> Result<ObfsOptions> {
+    let mode = match mode {
+        "" | "none" => ObfsMode::None,
+        "http" => ObfsMode::Http,
+        "tls" => ObfsMode::Tls,
+        other => anyhow::bail!("unsupported Snell obfs mode: {other}"),
+    };
+    Ok(ObfsOptions { mode, host })
+}
+
+fn parse_v6_mode(mode: &str) -> Result<V6Mode> {
+    match mode {
+        "" | "default" => Ok(V6Mode::Default),
+        "unshaped" => Ok(V6Mode::Unshaped),
+        "unsafe-raw" => Ok(V6Mode::UnsafeRaw),
+        other => anyhow::bail!("unsupported Snell v6 mode: {other}"),
+    }
 }

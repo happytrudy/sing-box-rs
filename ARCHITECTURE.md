@@ -12,10 +12,10 @@ Registry -- type-erased factory -- protocol-specific typed options
 Managers -- dependency validation -- staged lifecycle
        |
        v
-Inbound -> Session + BoxStream -> Router -> Outbound/Dialer -> BoxStream
-                                      |
-                                      v
-                              bidirectional relay
+Inbound -> Session + BoxStream/PacketConnection -> Router -> Outbound
+                                                     |
+                                                     v
+                                            bidirectional relay
 ```
 
 ## Stable protocol API
@@ -24,6 +24,7 @@ Inbound -> Session + BoxStream -> Router -> Outbound/Dialer -> BoxStream
 
 - `Session`: source, destination, user, inbound and selected outbound metadata
 - `ProxyStream` / `BoxStream`: object-safe asynchronous TCP stream
+- `PacketConnection` / `BoxPacketConnection`: object-safe addressed UDP packets
 - `Dialer`: creates a stream for a session
 - `Outbound`: a tagged dialer with declared dependencies
 - `Inbound`: a tagged lifecycle service with an optional bound address
@@ -67,7 +68,8 @@ toolchains without relying on constructors or linker-section discovery.
 A new protocol crate normally contains:
 
 1. Serde option types.
-2. An outbound implementing `Lifecycle + Dialer + Outbound`.
+2. An outbound implementing `Lifecycle + Dialer + Outbound`, with
+   `connect_packet` when it supports UDP.
 3. An inbound implementing `Lifecycle + Inbound`, when server support exists.
 4. A public `register(&mut Registry)` function.
 5. Protocol conformance and end-to-end tests.

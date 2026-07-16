@@ -1129,6 +1129,8 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "base64",
+ "blake2",
  "rand 0.8.7",
  "thiserror",
  "tokio",
