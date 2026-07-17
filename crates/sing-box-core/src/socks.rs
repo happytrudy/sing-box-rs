@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Address, Inbound, InboundBuildContext, Lifecycle, Network, Packet, PacketConnection, Registry,
-    Router, Session, StartStage, bind_tcp_listeners, normalize_socket_addr,
+    Router, Session, StartStage, bind_tcp_listeners,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,7 +71,6 @@ impl Lifecycle for SocksInbound {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((stream, source)) => {
-                                let source = normalize_socket_addr(source);
                                 let router = Arc::clone(&router);
                                 let tag = tag.clone();
                                 tokio::spawn(async move {
@@ -183,15 +182,7 @@ async fn handle_connect(
     router: Arc<Router>,
     destination: Address,
 ) -> Result<()> {
-    let mut session = Session {
-        network: Network::Tcp,
-        source: Some(source),
-        destination,
-        inbound: tag,
-        inbound_type: "socks".to_owned(),
-        outbound: None,
-        user: None,
-    };
+    let mut session = Session::inbound(Network::Tcp, source, destination, tag, "socks", None);
 
     match router.connect(&mut session).await {
         Ok(outbound) => {
@@ -220,15 +211,7 @@ async fn handle_udp_associate(
         control_source_ip: source.ip(),
         peer: Mutex::new(None),
     });
-    let session = Session {
-        network: Network::Udp,
-        source: Some(source),
-        destination,
-        inbound: tag,
-        inbound_type: "socks".to_owned(),
-        outbound: None,
-        user: None,
-    };
+    let session = Session::inbound(Network::Udp, source, destination, tag, "socks", None);
 
     tokio::select! {
         result = router.route_packet(session, connection) => result,

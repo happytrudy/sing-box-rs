@@ -128,6 +128,57 @@ loaded, but before inbounds are built. Non-final `route-options` actions mutate
 the session and continue matching; `route` and `reject` actions terminate rule
 evaluation.
 
+### Inbound source policy contract
+
+Source-address policy belongs to `sing-box-core`, not to protocol packages.
+This is a mandatory contract for every current and future inbound:
+
+1. The protocol creates every routable TCP stream and UDP session with
+   `Session::inbound`. It passes the real transport peer socket address, its
+   configured inbound tag, network type, destination, protocol type, and
+   authenticated user when available. A multiplexed protocol propagates the
+   outer transport peer to every accepted child stream or packet session.
+2. The protocol must not substitute a forwarded header, requested destination,
+   local listener address, or authenticated user address for the transport
+   peer. Trusted-proxy address replacement requires a separate explicit core
+   policy if it is added later.
+3. The protocol must not normalize, match, cache, or enforce source IP rules.
+   It only reports metadata. `Router::select` normalizes IPv4-mapped IPv6 and
+   performs all `source_ip_cidr` and rule-set evaluation.
+4. Route-rule conditions are conjunctive. A whitelist route containing both
+   `inbound` and `rule_set` matches only when the session tag is listed and the
+   source matches that rule-set. Tags not listed by the route rule are
+   unaffected. This behavior is identical for TCP and UDP.
+5. A protected tag uses an allow rule followed immediately by a reject rule.
+   Both must precede broader terminal rules such as a global port 53 route.
+   Rule evaluation is ordered and stops at the first `route` or `reject`.
+
+An official source-format empty whitelist is represented by `"rules": []`.
+It matches no client. Do not encode an empty whitelist as a condition with an
+empty value such as `{"source_ip_cidr": []}`; condition-level empty-list
+semantics are not a portable representation between sing-box versions.
+
+The required fail-closed shape is:
+
+```json
+{
+  "rules": [
+    {
+      "inbound": ["protected-in"],
+      "rule_set": ["client-whitelist"],
+      "action": "route",
+      "outbound": "direct"
+    },
+    {
+      "inbound": ["protected-in"],
+      "action": "reject",
+      "method": "drop"
+    }
+  ],
+  "final": "direct"
+}
+```
+
 Rule-set storage uses immutable compiled snapshots behind a short-lived read
 lock. Local watchers and remote updaters fully decode and compile the next
 source before swapping the snapshot, so routing never observes a partially

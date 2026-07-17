@@ -1,7 +1,7 @@
 {
   "log": {
     "disabled": false,
-    "output": "/tmp/sing-box-rs-access.log",
+    "output": "/etc/app/sing-box-rs/sing-box-rs-access.log",
     "level": "info",
     "timestamp": true
   },
@@ -32,28 +32,6 @@
     "server": "time.apple.com",
     "server_port": 123
   },
-
-  // Certificate providers are shared services. Uncomment this block and use
-  // "certificate_provider": "example-certificate" in an inbound TLS object.
-  // The token may be supplied with:
-  // export CLOUDFLARE_API_TOKEN='replace-with-a-zone-scoped-token'
-  "certificate_providers": [
-    // {
-    //   "type": "acme",
-    //   "tag": "example-certificate",
-    //   "domain": "h.example.com",
-    //   "email": "admin@example.com",
-    //   "data_directory": "acme",
-    //   "dns01_challenge": {
-    //     "provider": "cloudflare",
-    //     "api_token": "${CLOUDFLARE_API_TOKEN}"
-    //   }
-    // }
-  ],
-
-  // Inbounds intentionally live in examples/modular/conf/*.json and are
-  // appended by the -C configuration-directory option.
-
   "outbounds": [
     {
       "type": "direct",
@@ -64,7 +42,6 @@
       "tag": "block"
     }
   ],
-
   "route": {
     "default_domain_resolver": {
       "server": "cloudflare"
@@ -73,77 +50,29 @@
     "rule_set": [
       {
         "type": "local",
-        "tag": "client-whitelist-source",
+        "tag": "my-client-whitelist",
         "format": "source",
-        "path": "examples/advanced/ip_whitelist.json"
-      },
-      {
-        "type": "local",
-        "tag": "compiled-example",
-        "format": "binary",
-        "path": "examples/rule-set/compat.srs"
-      },
-      {
-        "type": "inline",
-        "tag": "private-destinations",
-        "rules": [
-          {
-            "ip_cidr": [
-              "10.0.0.0/8",
-              "172.16.0.0/12",
-              "192.168.0.0/16",
-              "fc00::/7"
-            ]
-          }
-        ]
+        "path": "/etc/app/ipauth/ip_whitelist.json"
       }
-
-      // Remote source and binary rule-sets are also supported:
-      // {
-      //   "type": "remote",
-      //   "tag": "remote-example",
-      //   "format": "binary",
-      //   "url": "https://example.com/rules.srs",
-      //   "update_interval": "6h"
-      // }
     ],
-
-    // Rules are evaluated in order. route-options continues evaluation;
-    // route and reject are terminal actions.
     "rules": [
       {
-        "port": 53,
+        "inbound": "hy2-in",
+        "rule_set": ["my-client-whitelist"],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": ".blocked.invalid",
+        "inbound": ["hy2-in"],
         "action": "reject",
         "method": "drop"
       },
       {
-        "inbound": "hy2-in",
-        "auth_user": "default",
-        "network": "tcp",
-        "action": "route",
-        "outbound": "direct"
-      },
-      {
-        "inbound": "hy2-in",
-        "rule_set": "compiled-example",
+        "port": 53,
         "action": "route",
         "outbound": "direct"
       }
-
-      // Example of a non-terminal destination rewrite:
-      // {
-      //   "inbound": "cloudflare-tunnel",
-      //   "action": "route-options",
-      //   "override_address": "127.0.0.1",
-      //   "override_port": 8080
-      // }
     ],
-
     "final": "direct"
   }
 }

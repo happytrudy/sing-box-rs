@@ -297,8 +297,17 @@ mod tests {
         let loaded = load(sources).await.unwrap();
         assert_eq!(loaded.config.inbounds.len(), 1);
         assert_eq!(loaded.config.outbounds.len(), 2);
-        assert_eq!(loaded.config.route.rule_set.len(), 3);
-        assert_eq!(loaded.config.route.rules.len(), 4);
+        assert!(
+            loaded
+                .config
+                .route
+                .rule_set
+                .iter()
+                .any(|rule_set| rule_set.tag == "my-client-whitelist")
+        );
+        assert!(loaded.config.route.rules.iter().any(|rule| {
+            rule.action == "reject" && rule.inbound.as_slice().iter().any(|tag| tag == "hy2-in")
+        }));
         assert_eq!(loaded.config.route.final_outbound, "direct");
         assert!(loaded.config.dns.is_some());
         assert!(loaded.config.ntp.is_some());

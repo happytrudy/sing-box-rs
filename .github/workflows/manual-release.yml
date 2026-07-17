@@ -1,0 +1,278 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: Create the GitHub Release as a draft
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Resolve release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout sing-box-rs
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          path: sing-box-rs
+          persist-credentials: false
+
+      - name: Read workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(awk '
+            $0 == "[workspace.package]" { in_package = 1; next }
+            in_package && /^\[/ { exit }
+            in_package && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^=]*=[[:space:]]*/, "", value)
+              gsub(/"/, "", value)
+              print value
+              exit
+            }
+          ' sing-box-rs/Cargo.toml)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid or missing workspace version: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if git -C sing-box-rs rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            tagged_commit="$(git -C sing-box-rs rev-list -n 1 "$tag")"
+            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+              echo "$tag already points to $tagged_commit; bump Cargo.toml before releasing $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "### Manual release"
+            echo ""
+            echo "- Version: \`$version\`"
+            echo "- Tag: \`$tag\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Test release source
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout sing-box-rs
+        uses: actions/checkout@v7
+        with:
+          path: sing-box-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-quic-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-quic-rs
+          ref: master
+          path: sing-quic-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-snell-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-snell-rs
+          ref: master
+          path: sing-snell-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-dns-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-dns-rs
+          ref: master
+          path: sing-dns-rs
+          persist-credentials: false
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Run workspace tests
+        working-directory: sing-box-rs
+        run: cargo test --locked --workspace
+
+      - name: Run strict clippy
+        working-directory: sing-box-rs
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs:
+      - metadata
+      - verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout sing-box-rs
+        uses: actions/checkout@v7
+        with:
+          path: sing-box-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-quic-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-quic-rs
+          ref: master
+          path: sing-quic-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-snell-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-snell-rs
+          ref: master
+          path: sing-snell-rs
+          persist-credentials: false
+
+      - name: Checkout happytrudy/sing-dns-rs
+        uses: actions/checkout@v7
+        with:
+          repository: happytrudy/sing-dns-rs
+          ref: master
+          path: sing-dns-rs
+          persist-credentials: false
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        working-directory: sing-box-rs
+        run: cargo build --locked --release --package sing-box-rs --target "${{ matrix.target }}"
+
+      - name: Package release archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          package="sing-box-rs-$TAG-$PLATFORM"
+          mkdir -p "staging/$package" dist
+          install -m 0755 \
+            "sing-box-rs/target/$TARGET/release/sing-box-rs" \
+            "staging/$package/sing-box-rs"
+          cp sing-box-rs/README.md "staging/$package/"
+          cp sing-box-rs/ARCHITECTURE.md "staging/$package/"
+          cp -R sing-box-rs/examples "staging/$package/"
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "target=$TARGET"
+            echo "sing-box-rs=$(git -C sing-box-rs rev-parse HEAD)"
+            echo "sing-quic-rs=$(git -C sing-quic-rs rev-parse HEAD)"
+            echo "sing-snell-rs=$(git -C sing-snell-rs rev-parse HEAD)"
+            echo "sing-dns-rs=$(git -C sing-dns-rs rev-parse HEAD)"
+          } > "staging/$package/BUILD-INFO.txt"
+
+          tar -C staging -czf "dist/$package.tar.gz" "$package"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create or update release
+        shell: bash
+        env:
+          DRAFT: ${{ inputs.draft }}
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          mapfile -t assets < <(find dist -maxdepth 1 -type f -print | sort)
+          if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPOSITORY"
+            gh release edit "$TAG" \
+              --repo "$REPOSITORY" \
+              --title "sing-box-rs $TAG" \
+              --draft="$DRAFT" \
+              --prerelease="$PRERELEASE"
+            echo "Updated assets on existing release $TAG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          args=(
+            release create "$TAG"
+            "${assets[@]}"
+            --repo "$REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "sing-box-rs $TAG"
+            --generate-notes
+          )
+          if [[ "$DRAFT" == "true" ]]; then
+            args+=(--draft)
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
+          echo "Published release $TAG" >> "$GITHUB_STEP_SUMMARY"

@@ -88,6 +88,35 @@ pub fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
 }
 
 impl Session {
+    /// Creates the routing context reported by an inbound protocol.
+    ///
+    /// Inbounds must pass the transport peer unchanged. Address-family
+    /// normalization and all source-based policy decisions belong to Router.
+    pub fn inbound(
+        network: Network,
+        source: SocketAddr,
+        destination: Address,
+        inbound: impl Into<String>,
+        inbound_type: impl Into<String>,
+        user: Option<String>,
+    ) -> Self {
+        Self {
+            network,
+            source: Some(source),
+            destination,
+            inbound: inbound.into(),
+            inbound_type: inbound_type.into(),
+            outbound: None,
+            user,
+        }
+    }
+
+    pub fn source_ip(&self) -> Option<IpAddr> {
+        self.source
+            .map(normalize_socket_addr)
+            .map(|source| source.ip())
+    }
+
     pub fn outbound(destination: Address) -> Self {
         Self {
             network: Network::Tcp,

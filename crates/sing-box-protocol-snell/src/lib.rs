@@ -9,7 +9,7 @@ use serde::Deserialize;
 use sing_box_core::{
     Address, BoxPacketConnection, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle,
     Network, Outbound, OutboundBuildContext, OutboundManagerDialer, Packet, PacketConnection,
-    Registry, Router, Session, StartStage, bind_tcp_listeners, normalize_socket_addr,
+    Registry, Router, Session, StartStage, bind_tcp_listeners,
 };
 use sing_snell::{
     AcceptedSession, Address as SnellAddress, Client, ClientOptions, ObfsMode, ObfsOptions,
@@ -226,7 +226,6 @@ impl Lifecycle for SnellInbound {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((stream, source)) => {
-                                let source = normalize_socket_addr(source);
                                 let router = Arc::clone(&router);
                                 let server = server.clone();
                                 let tag = tag.clone();
@@ -289,27 +288,25 @@ async fn route_accepted(
         AcceptedSession::Stream(accepted) => {
             let destination =
                 Address::new(accepted.destination.host(), accepted.destination.port())?;
-            let session = Session {
-                network: Network::Tcp,
-                source: Some(source),
+            let session = Session::inbound(
+                Network::Tcp,
+                source,
                 destination,
-                inbound: tag,
-                inbound_type: "snell".to_owned(),
-                outbound: None,
-                user: accepted.user,
-            };
+                tag,
+                "snell",
+                accepted.user,
+            );
             router.route(session, Box::new(accepted.stream)).await
         }
         AcceptedSession::Packet(accepted) => {
-            let session = Session {
-                network: Network::Udp,
-                source: Some(source),
-                destination: Address::new("0.0.0.0", 0)?,
-                inbound: tag,
-                inbound_type: "snell".to_owned(),
-                outbound: None,
-                user: accepted.user,
-            };
+            let session = Session::inbound(
+                Network::Udp,
+                source,
+                Address::new("0.0.0.0", 0)?,
+                tag,
+                "snell",
+                accepted.user,
+            );
             router
                 .route_packet(
                     session,

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     BoxPacketConnection, BoxStream, Network, OutboundManager, Session,
     config::{HeadlessRuleConfig, RouteConfig, RouteRuleConfig, RuleSetConfig},
-    parse_extended_json,
+    normalize_socket_addr, parse_extended_json,
 };
 
 #[derive(Debug)]
@@ -177,11 +177,18 @@ impl Router {
     }
 
     fn select(&self, session: &mut Session) -> Result<String> {
+        session.source = session.source.map(normalize_socket_addr);
         for (index, rule) in self.rules.iter().enumerate() {
             if !rule.matcher.matches(session, &self.rule_sets) {
                 continue;
             }
-            tracing::debug!(rule = index, inbound = %session.inbound, "matched route rule");
+            tracing::debug!(
+                rule = index,
+                inbound = %session.inbound,
+                source = ?session.source,
+                destination = %session.destination,
+                "matched route rule"
+            );
             match &rule.action {
                 RuleAction::RouteOptions {
                     override_address,
@@ -196,6 +203,14 @@ impl Router {
                 }
                 RuleAction::Route { outbound } => return Ok(outbound.clone()),
                 RuleAction::Reject { method } => {
+                    tracing::info!(
+                        rule = index,
+                        inbound = %session.inbound,
+                        source = ?session.source,
+                        destination = %session.destination,
+                        %method,
+                        "rejected connection"
+                    );
                     anyhow::bail!("connection rejected by route rule using {method}")
                 }
             }
@@ -240,6 +255,7 @@ impl Router {
         tracing::info!(
             inbound = %session.inbound,
             outbound = ?session.outbound,
+            source = ?session.source,
             destination = %session.destination,
             user = ?session.user,
             "routing TCP connection"
@@ -262,6 +278,7 @@ impl Router {
         tracing::info!(
             inbound = %session.inbound,
             outbound = ?session.outbound,
+            source = ?session.source,
             user = ?session.user,
             "routing UDP session"
         );
@@ -421,6 +438,14 @@ impl RuleSetFormat {
 struct FileFingerprint {
     length: u64,
     modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 #[derive(Clone)]
@@ -467,6 +492,12 @@ async fn prepare_rule_set(
             let rules = decode_and_compile_rule_set(&tag, format, &content)
                 .with_context(|| format!("load rule-set {}", path.display()))?;
             let fingerprint = file_fingerprint(&path).await?;
+            tracing::info!(
+                rule_set = %tag,
+                path = %path.display(),
+                rules = rules.len(),
+                "loaded local rule-set"
+            );
             let state = Arc::new(CompiledRuleSet::new(rules));
             Ok((
                 Arc::clone(&state),
@@ -549,13 +580,26 @@ fn decode_and_compile_rule_set(
 }
 
 fn compile_rule_set_rules(tag: &str, rules: Vec<HeadlessRuleConfig>) -> Result<Vec<HeadlessRule>> {
-    anyhow::ensure!(!rules.is_empty(), "rule-set {tag} is empty");
     rules
         .into_iter()
         .enumerate()
-        .map(|(index, rule)| {
-            HeadlessRule::compile(rule)
-                .with_context(|| format!("compile rule-set {tag} rule {index}"))
+        .filter_map(|(index, rule)| {
+            if rule.kind.is_empty() || rule.kind == "default" {
+                match RuleMatcher::from_headless(&rule) {
+                    Ok(matcher) if matcher.is_empty() => return None,
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Some(
+                            Err(error)
+                                .with_context(|| format!("compile rule-set {tag} rule {index}")),
+                        );
+                    }
+                }
+            }
+            Some(
+                HeadlessRule::compile(rule)
+                    .with_context(|| format!("compile rule-set {tag} rule {index}")),
+            )
         })
         .collect()
 }
@@ -564,9 +608,19 @@ async fn file_fingerprint(path: &Path) -> Result<FileFingerprint> {
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("read rule-set metadata {}", path.display()))?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     Ok(FileFingerprint {
         length: metadata.len(),
         modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
     })
 }
 
@@ -855,7 +909,7 @@ impl RuleMatcher {
     }
 
     fn matches_base(&self, session: &Session) -> bool {
-        let source = session.source;
+        let source = session.source.map(normalize_socket_addr);
         let destination_ip = IpAddr::from_str(&session.destination.host).ok();
         let host = session.destination.host.to_ascii_lowercase();
         let domain_matches = self.domains.is_empty()
@@ -882,10 +936,10 @@ impl RuleMatcher {
                     .is_some_and(|user| self.users.contains(user)))
             && domain_matches
             && (self.source_cidrs.is_empty()
-                || source.is_some_and(|source| {
+                || session.source_ip().is_some_and(|source_ip| {
                     self.source_cidrs
                         .iter()
-                        .any(|cidr| cidr.contains(source.ip()))
+                        .any(|cidr| cidr.contains(source_ip))
                 }))
             && self.source_private.is_none_or(|expected| {
                 source.is_some_and(|source| is_private(source.ip()) == expected)
@@ -1044,7 +1098,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Address, config::RuleSetSource};
+    use crate::{Address, config::RuleSetSource, normalize_socket_addr};
 
     fn session(source: &str, destination: &str, port: u16) -> Session {
         Session {
@@ -1158,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn route_rule_matches_source_rule_set() {
+    fn source_rule_set_is_scoped_by_inbound_tag_for_tcp_and_udp() {
         let headless: HeadlessRuleConfig = serde_json::from_value(serde_json::json!({
             "source_ip_cidr": "192.0.2.0/24"
         }))
@@ -1179,14 +1233,65 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            rule.matcher
-                .matches(&session("192.0.2.100:1234", "example.com", 443), &rule_sets)
-        );
+        let tcp = session("192.0.2.100:1234", "example.com", 443);
+        assert!(rule.matcher.matches(&tcp, &rule_sets));
+
+        let mut udp = tcp.clone();
+        udp.network = Network::Udp;
+        assert!(rule.matcher.matches(&udp, &rule_sets));
+
+        let mut unconfigured_inbound = tcp;
+        unconfigured_inbound.inbound = "other-in".into();
+        assert!(!rule.matcher.matches(&unconfigured_inbound, &rule_sets));
+
         assert!(!rule.matcher.matches(
             &session("198.51.100.1:1234", "example.com", 443),
             &rule_sets
         ));
+    }
+
+    #[test]
+    fn empty_whitelist_rule_sets_match_nothing() {
+        for source in [
+            br#"{"version":1,"rules":[]}"#.as_slice(),
+            br#"{"version":1,"rules":[{"source_ip_cidr":[]}]}"#.as_slice(),
+        ] {
+            let rules =
+                decode_and_compile_rule_set("empty", RuleSetFormat::Source, source).unwrap();
+            let rule_set = CompiledRuleSet::new(rules);
+            assert!(!rule_set.matches(&session("192.0.2.1:1234", "example.com", 443)));
+            assert!(!rule_set.matches(&session("198.51.100.1:1234", "example.com", 443)));
+        }
+    }
+
+    #[test]
+    fn whitelist_matches_configured_ipv4_ipv6_and_mapped_ipv4() {
+        let source = br#"{
+            "version": 1,
+            "rules": [{
+                "source_ip_cidr": [
+                    "2409:8a4c:d21:acf0:58aa:88c7:bcea:c803/128",
+                    "117.154.46.9/32"
+                ]
+            }]
+        }"#;
+        let rules =
+            decode_and_compile_rule_set("whitelist", RuleSetFormat::Source, source).unwrap();
+        let rule_set = CompiledRuleSet::new(rules);
+
+        assert!(rule_set.matches(&session(
+            "[2409:8a4c:d21:acf0:58aa:88c7:bcea:c803]:1234",
+            "example.com",
+            443
+        )));
+        assert!(rule_set.matches(&session("117.154.46.9:1234", "example.com", 443)));
+
+        let mapped = normalize_socket_addr("[::ffff:117.154.46.9]:1234".parse().unwrap());
+        let mut mapped_session = session("127.0.0.1:1234", "example.com", 443);
+        mapped_session.source = Some(mapped);
+        assert!(rule_set.matches(&mapped_session));
+
+        assert!(!rule_set.matches(&session("117.154.46.10:1234", "example.com", 443)));
     }
 
     #[test]
@@ -1238,6 +1343,24 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "rule-set was not reloaded"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!state.matches(&session("192.0.2.1:1234", "example.com", 443)));
+
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "rules": [{"source_ip_cidr": []}]
+            }"#,
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while state.matches(&session("198.51.100.1:1234", "example.com", 443)) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "empty whitelist was not reloaded"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

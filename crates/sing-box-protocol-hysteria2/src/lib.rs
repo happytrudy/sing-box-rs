@@ -10,7 +10,6 @@ use serde::Deserialize;
 use sing_box_core::{
     Address, BoxStream, Certificate, Dialer, Inbound, InboundBuildContext, Lifecycle, Network,
     Outbound, OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
-    normalize_socket_addr,
 };
 use sing_quic::Error as SingQuicError;
 use sing_quic::hysteria2::{
@@ -322,15 +321,14 @@ async fn run_server(
                                 return;
                             }
                         };
-                        let session = Session {
-                            network: Network::Tcp,
-                            source: Some(normalize_socket_addr(accepted.source)),
+                        let session = Session::inbound(
+                            Network::Tcp,
+                            accepted.source,
                             destination,
-                            inbound: tag,
-                            inbound_type: "hysteria2".to_owned(),
-                            outbound: None,
-                            user: Some(accepted.user),
-                        };
+                            tag,
+                            "hysteria2",
+                            Some(accepted.user),
+                        );
                         if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
                             tracing::debug!(%error, "Hysteria2 stream closed");
                         }

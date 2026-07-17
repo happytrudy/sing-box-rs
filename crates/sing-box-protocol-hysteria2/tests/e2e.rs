@@ -1,6 +1,10 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -44,14 +48,22 @@ impl CertificateProvider for TestProvider {
 }
 
 #[tokio::test]
-async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
+async fn hysteria2_source_whitelist_hot_reload_is_fail_closed() -> Result<()> {
     let echo_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let echo_addr = echo_listener.local_addr()?;
+    let echo_connections = Arc::new(AtomicUsize::new(0));
+    let echo_connections_task = Arc::clone(&echo_connections);
     let echo_task = tokio::spawn(async move {
-        let (mut stream, _) = echo_listener.accept().await?;
-        let (mut reader, mut writer) = stream.split();
-        tokio::io::copy(&mut reader, &mut writer).await?;
-        Ok::<_, std::io::Error>(())
+        loop {
+            let (mut stream, _) = echo_listener.accept().await?;
+            echo_connections_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = stream.split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
     });
 
     let certificate = generate_simple_self_signed(vec!["localhost".into()])?;
@@ -136,7 +148,7 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
                     "method": "drop"
                 }
             ],
-            "final": "block"
+            "final": "direct"
         }
     }))?;
     let server = Engine::new(server_config, registry.clone()).await?;
@@ -193,9 +205,40 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
     stream.read_exact(&mut response).await?;
     assert_eq!(response, payload);
     stream.shutdown().await?;
+    assert_eq!(echo_connections.load(Ordering::SeqCst), 1);
+
+    std::fs::write(
+        &rule_set_path,
+        r#"{
+            "version": 1,
+            "rules": []
+        }"#,
+    )?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut denied = TcpStream::connect(socks_addr).await?;
+    denied.write_all(&[5, 1, 0]).await?;
+    denied.read_exact(&mut method_reply).await?;
+    assert_eq!(method_reply, [5, 0]);
+    denied.write_all(&request).await?;
+
+    // Hysteria2 can acknowledge the proxy stream before the server-side router
+    // closes it. The authoritative assertion is that no second connection
+    // reaches the direct target after the whitelist becomes empty.
+    let mut denied_reply = [0u8; 10];
+    let _ =
+        tokio::time::timeout(Duration::from_secs(1), denied.read_exact(&mut denied_reply)).await;
+    let _ = denied.write_all(b"must not reach direct").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        echo_connections.load(Ordering::SeqCst),
+        1,
+        "empty client whitelist must not fall through to route.final"
+    );
 
     client.shutdown().await?;
     server.shutdown().await?;
-    echo_task.await??;
+    echo_task.abort();
+    let _ = echo_task.await;
     Ok(())
 }

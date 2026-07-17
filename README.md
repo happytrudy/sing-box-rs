@@ -326,3 +326,16 @@ exercise SOCKS5 TCP reuse and UDP ASSOCIATE through Snell and direct routing:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Manual release
+
+The `Manual Release` workflow under GitHub Actions publishes Linux AMD64 and
+ARM64 archives. It reads the release version from `[workspace.package]` in the
+root `Cargo.toml`; for example, version `0.1.0` produces release tag `v0.1.0`.
+
+Before running it, push matching `master` revisions of `sing-quic-rs`,
+`sing-snell-rs`, and `sing-dns-rs` to the `happytrudy` GitHub account. Open
+**Actions**, select **Manual Release**, choose **Run workflow**, and optionally
+enable draft or prerelease mode. Re-running the workflow for the same commit
+replaces the existing release assets; using the same version for a different
+commit is rejected.
