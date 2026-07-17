@@ -8,16 +8,19 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
-    Address, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Outbound,
-    OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
+    Address, BoxStream, Certificate, Dialer, Inbound, InboundBuildContext, Lifecycle, Network,
+    Outbound, OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
+    normalize_socket_addr,
 };
 use sing_quic::Error as SingQuicError;
 use sing_quic::hysteria2::{
     Client, ClientBandwidth, ClientOptions, Server, ServerBandwidth, ServerOptions,
     User as Hysteria2User,
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{sync::Mutex, sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+
+mod masquerade;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +92,8 @@ struct Hysteria2InboundOptions {
     down_mbps: u64,
     #[serde(default)]
     ignore_client_bandwidth: bool,
+    #[serde(default)]
+    masquerade: Option<masquerade::MasqueradeOptions>,
     tls: InboundTlsOptions,
     users: Vec<UserOptions>,
 }
@@ -100,23 +105,39 @@ fn default_listen() -> String {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InboundTlsOptions {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    alpn: Vec<String>,
+    #[serde(default)]
+    server_name: String,
+    #[serde(default)]
+    certificate_provider: String,
+    #[serde(default)]
     certificate_path: String,
+    #[serde(default)]
     key_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserOptions {
+    #[serde(default)]
     name: String,
     password: String,
 }
 
+enum CertificateSource {
+    Static(Arc<Certificate>),
+    Provider(watch::Receiver<Option<Arc<Certificate>>>),
+}
+
 struct PreparedServer {
     listen: Vec<SocketAddr>,
-    certificate_chain: Vec<Vec<u8>>,
-    private_key: Vec<u8>,
+    certificate: CertificateSource,
     users: Vec<Hysteria2User>,
     bandwidth: ServerBandwidth,
+    masquerade: Option<Arc<dyn sing_quic::hysteria2::MasqueradeHandler>>,
 }
 
 struct Running {
@@ -150,11 +171,21 @@ impl Lifecycle for Hysteria2Inbound {
             .context("Hysteria2 inbound cannot be restarted after close")?;
         let PreparedServer {
             listen,
-            certificate_chain,
-            private_key,
+            certificate,
             users,
             bandwidth,
+            masquerade,
         } = prepared;
+        let (certificate, certificate_updates) = match certificate {
+            CertificateSource::Static(certificate) => (certificate, None),
+            CertificateSource::Provider(receiver) => {
+                let certificate = receiver
+                    .borrow()
+                    .clone()
+                    .context("certificate provider is not ready")?;
+                (certificate, Some(receiver))
+            }
+        };
         let ipv6_wildcard = listen[0].ip().is_unspecified() && listen[0].is_ipv6();
         let mut servers: Vec<Arc<Server>> = Vec::with_capacity(listen.len());
         let mut assigned_port = 0;
@@ -162,14 +193,15 @@ impl Lifecycle for Hysteria2Inbound {
             if index > 0 && address.port() == 0 {
                 address.set_port(assigned_port);
             }
-            let server = match Server::bind_with_bandwidth(
+            let server = match Server::bind_with_bandwidth_and_masquerade(
                 ServerOptions {
                     listen: address,
-                    certificate_chain: certificate_chain.clone(),
-                    private_key: private_key.clone(),
+                    certificate_chain: certificate.certificate_chain.clone(),
+                    private_key: certificate.private_key.clone(),
                     users: users.clone(),
                 },
                 bandwidth,
+                masquerade.clone(),
             ) {
                 Ok(server) => Arc::new(server),
                 Err(SingQuicError::Io(error))
@@ -194,7 +226,7 @@ impl Lifecycle for Hysteria2Inbound {
         let local_addr = servers[0].local_addr()?;
         *self.local_addr.write().expect("Hysteria2 address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
-        let tasks = servers
+        let mut tasks = servers
             .iter()
             .map(|server| {
                 tokio::spawn(run_server(
@@ -204,7 +236,15 @@ impl Lifecycle for Hysteria2Inbound {
                     self.tag.clone(),
                 ))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if let Some(receiver) = certificate_updates {
+            tasks.push(tokio::spawn(watch_certificate_updates(
+                servers.clone(),
+                receiver,
+                cancel.clone(),
+                self.tag.clone(),
+            )));
+        }
         *self.running.lock().await = Some(Running {
             cancel,
             tasks,
@@ -225,6 +265,36 @@ impl Lifecycle for Hysteria2Inbound {
             }
         }
         Ok(())
+    }
+}
+
+async fn watch_certificate_updates(
+    servers: Vec<Arc<Server>>,
+    mut receiver: watch::Receiver<Option<Arc<Certificate>>>,
+    cancel: CancellationToken,
+    tag: String,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            changed = receiver.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        let Some(certificate) = receiver.borrow_and_update().clone() else {
+            continue;
+        };
+        for server in &servers {
+            if let Err(error) = server.update_certificate(
+                certificate.certificate_chain.clone(),
+                certificate.private_key.clone(),
+            ) {
+                tracing::warn!(inbound = %tag, %error, "failed to apply certificate update");
+            }
+        }
+        tracing::info!(inbound = %tag, "applied certificate provider update");
     }
 }
 
@@ -254,7 +324,7 @@ async fn run_server(
                         };
                         let session = Session {
                             network: Network::Tcp,
-                            source: Some(accepted.source),
+                            source: Some(normalize_socket_addr(accepted.source)),
                             destination,
                             inbound: tag,
                             inbound_type: "hysteria2".to_owned(),
@@ -293,8 +363,19 @@ impl Inbound for Hysteria2Inbound {
 pub fn register(registry: &mut Registry) -> Result<()> {
     registry.register_outbound::<Hysteria2OutboundOptions, _, _>(
         "hysteria2",
-        |_context: OutboundBuildContext, tag, options| async move {
-            let server = resolve_server(&options.server, options.server_port).await?;
+        |context: OutboundBuildContext, tag, options| async move {
+            let server = context
+                .system_dialer
+                .resolve(&options.server, options.server_port)
+                .await?
+                .into_iter()
+                .next()
+                .with_context(|| {
+                    format!(
+                        "no address found for {}:{}",
+                        options.server, options.server_port
+                    )
+                })?;
             let certificate_data = tokio::fs::read(&options.tls.certificate_path)
                 .await
                 .with_context(|| format!("read {}", options.tls.certificate_path))?;
@@ -323,16 +404,43 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         |context: InboundBuildContext, tag, options| async move {
             anyhow::ensure!(!options.users.is_empty(), "Hysteria2 users cannot be empty");
             let listen = listen_addresses(&options.listen, options.listen_port)?;
-            let certificate_data = tokio::fs::read(&options.tls.certificate_path)
-                .await
-                .with_context(|| format!("read {}", options.tls.certificate_path))?;
-            let key_data = tokio::fs::read(&options.tls.key_path)
-                .await
-                .with_context(|| format!("read {}", options.tls.key_path))?;
+            anyhow::ensure!(
+                options.tls.alpn.is_empty()
+                    || options.tls.alpn.iter().any(|protocol| protocol == "h3"),
+                "Hysteria2 TLS ALPN must include h3"
+            );
+            let certificate = if options.tls.certificate_provider.is_empty() {
+                anyhow::ensure!(
+                    !options.tls.certificate_path.is_empty() && !options.tls.key_path.is_empty(),
+                    "Hysteria2 TLS requires certificate_provider or certificate_path/key_path"
+                );
+                let certificate_data = tokio::fs::read(&options.tls.certificate_path)
+                    .await
+                    .with_context(|| format!("read {}", options.tls.certificate_path))?;
+                let key_data = tokio::fs::read(&options.tls.key_path)
+                    .await
+                    .with_context(|| format!("read {}", options.tls.key_path))?;
+                CertificateSource::Static(Arc::new(Certificate::new(
+                    parse_certificates(&certificate_data)?,
+                    parse_private_key(&key_data)?,
+                )?))
+            } else {
+                anyhow::ensure!(
+                    options.tls.certificate_path.is_empty() && options.tls.key_path.is_empty(),
+                    "Hysteria2 TLS certificate_provider conflicts with certificate_path/key_path"
+                );
+                CertificateSource::Provider(
+                    context
+                        .certificate_providers
+                        .subscribe(&options.tls.certificate_provider, &options.tls.server_name)
+                        .await?,
+                )
+            };
+            let _ = options.tls.enabled;
+            let masquerade = masquerade::build(options.masquerade, context.system_dialer)?;
             let prepared = PreparedServer {
                 listen,
-                certificate_chain: parse_certificates(&certificate_data)?,
-                private_key: parse_private_key(&key_data)?,
+                certificate,
                 users: options
                     .users
                     .into_iter()
@@ -346,6 +454,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     receive_bps: mbps_to_bps(options.down_mbps)?,
                     ignore_client_bandwidth: options.ignore_client_bandwidth,
                 },
+                masquerade,
             };
             Ok(Arc::new(Hysteria2Inbound {
                 tag,
@@ -362,13 +471,6 @@ pub fn register(registry: &mut Registry) -> Result<()> {
 fn mbps_to_bps(mbps: u64) -> Result<u64> {
     mbps.checked_mul(125_000)
         .context("Hysteria2 bandwidth is too large")
-}
-
-async fn resolve_server(host: &str, port: u16) -> Result<SocketAddr> {
-    tokio::net::lookup_host((host, port))
-        .await?
-        .next()
-        .with_context(|| format!("no address found for {host}:{port}"))
 }
 
 fn parse_certificates(data: &[u8]) -> Result<Vec<Vec<u8>>> {

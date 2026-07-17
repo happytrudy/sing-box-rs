@@ -1,13 +1,47 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+};
 
 use anyhow::Result;
+use async_trait::async_trait;
 use rcgen::generate_simple_self_signed;
-use sing_box_core::{Config, Engine, Registry, register_builtins};
+use serde::Deserialize;
+use sing_box_core::{
+    Certificate, CertificateProvider, Config, Engine, Lifecycle, Registry, register_builtins,
+};
 use tempfile::tempdir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
 };
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestProviderOptions {}
+
+struct TestProvider {
+    tag: String,
+    sender: watch::Sender<Option<Arc<Certificate>>>,
+}
+
+#[async_trait]
+impl Lifecycle for TestProvider {}
+
+impl CertificateProvider for TestProvider {
+    fn kind(&self) -> &'static str {
+        "test"
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn subscribe(&self, _server_name: &str) -> Result<watch::Receiver<Option<Arc<Certificate>>>> {
+        Ok(self.sender.subscribe())
+    }
+}
 
 #[tokio::test]
 async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
@@ -26,14 +60,37 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
     let directory = tempdir()?;
     let certificate_path = directory.path().join("certificate.der");
     let private_key_path = directory.path().join("private-key.der");
-    std::fs::write(&certificate_path, certificate_der)?;
-    std::fs::write(&private_key_path, private_key_der)?;
+    let rule_set_path = directory.path().join("client-whitelist.json");
+    std::fs::write(&certificate_path, &certificate_der)?;
+    std::fs::write(&private_key_path, &private_key_der)?;
+    std::fs::write(
+        &rule_set_path,
+        r#"{
+            "version": 5,
+            "rules": [{"source_ip_cidr": ["127.0.0.1/32"]}]
+        }"#,
+    )?;
 
     let mut registry = Registry::new();
     register_builtins(&mut registry)?;
+    let provided_certificate = Arc::new(Certificate::new(vec![certificate_der], private_key_der)?);
+    registry.register_certificate_provider::<TestProviderOptions, _, _>(
+        "test",
+        move |_context, tag, _options| {
+            let certificate = Arc::clone(&provided_certificate);
+            async move {
+                let (sender, _) = watch::channel(Some(certificate));
+                Ok(Arc::new(TestProvider { tag, sender }) as Arc<dyn CertificateProvider>)
+            }
+        },
+    )?;
     sing_box_protocol_hysteria2::register(&mut registry)?;
 
     let server_config: Config = serde_json::from_value(serde_json::json!({
+        "certificate_providers": [{
+            "type": "test",
+            "tag": "shared-test-certificate"
+        }],
         "inbounds": [{
             "type": "hysteria2",
             "tag": "hy2-in",
@@ -41,14 +98,46 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
             "listen_port": 0,
             "up_mbps": 100,
             "down_mbps": 100,
+            "masquerade": {
+                "type": "string",
+                "status_code": 200,
+                "headers": {"content-type": "text/plain"},
+                "content": "decoy"
+            },
             "tls": {
-                "certificate_path": certificate_path,
-                "key_path": private_key_path
+                "enabled": true,
+                "alpn": ["h3"],
+                "server_name": "localhost",
+                "certificate_provider": "shared-test-certificate"
             },
             "users": [{"name": "alice", "password": "secret"}]
         }],
-        "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final_outbound": "direct"}
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"}
+        ],
+        "route": {
+            "rule_set": [{
+                "type": "local",
+                "tag": "client-whitelist",
+                "format": "source",
+                "path": rule_set_path
+            }],
+            "rules": [
+                {
+                    "inbound": "hy2-in",
+                    "rule_set": "client-whitelist",
+                    "action": "route",
+                    "outbound": "direct"
+                },
+                {
+                    "inbound": "hy2-in",
+                    "action": "reject",
+                    "method": "drop"
+                }
+            ],
+            "final": "block"
+        }
     }))?;
     let server = Engine::new(server_config, registry.clone()).await?;
     server.start().await?;
@@ -74,7 +163,7 @@ async fn socks_to_hysteria2_to_direct_echo() -> Result<()> {
                 "certificate_path": certificate_path
             }
         }],
-        "route": {"final_outbound": "hy2-out"}
+        "route": {"final": "hy2-out"}
     }))?;
     let client = Engine::new(client_config, registry).await?;
     client.start().await?;

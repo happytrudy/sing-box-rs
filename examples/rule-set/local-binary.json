@@ -1,0 +1,22 @@
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "compiled-example",
+        "path": "examples/rule-set/compat.srs"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "compiled-example",
+        "outbound": "direct"
+      }
+    ],
+    "final": "block"
+  },
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"}
+  ]
+}

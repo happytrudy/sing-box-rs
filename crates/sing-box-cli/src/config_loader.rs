@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use sing_box_core::Config;
+use sing_box_core::{Config, parse_extended_json};
 
 pub struct ConfigSources {
     files: Vec<PathBuf>,
@@ -85,7 +85,7 @@ pub async fn load(sources: ConfigSources) -> Result<LoadedConfig> {
         let content = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("read config {}", path.display()))?;
-        let source: Value = serde_json::from_str(&content)
+        let source: Value = parse_extended_json(&content)
             .with_context(|| format!("decode config {}", path.display()))?;
         merged = Some(match merged {
             Some(destination) => merge_value(source, destination)
@@ -277,5 +277,30 @@ mod tests {
         assert_eq!(loaded.config.inbounds[1].tag, "b");
         assert_eq!(loaded.config.outbounds.len(), 1);
         assert_eq!(loaded.config.route.final_outbound, "direct");
+    }
+
+    #[tokio::test]
+    async fn loads_complete_modular_example() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let action = parse_args([
+            "-c".to_owned(),
+            root.join("examples/modular/config.json")
+                .display()
+                .to_string(),
+            "-C".to_owned(),
+            root.join("examples/modular/conf").display().to_string(),
+        ])
+        .unwrap();
+        let CliAction::Run(sources) = action else {
+            panic!("expected run action")
+        };
+        let loaded = load(sources).await.unwrap();
+        assert_eq!(loaded.config.inbounds.len(), 1);
+        assert_eq!(loaded.config.outbounds.len(), 2);
+        assert_eq!(loaded.config.route.rule_set.len(), 3);
+        assert_eq!(loaded.config.route.rules.len(), 4);
+        assert_eq!(loaded.config.route.final_outbound, "direct");
+        assert!(loaded.config.dns.is_some());
+        assert!(loaded.config.ntp.is_some());
     }
 }

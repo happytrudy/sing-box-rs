@@ -1,0 +1,23 @@
+{
+  "version": 5,
+  "rules": [
+    {
+      "network": ["tcp", "udp"],
+      "domain": ["example.com", "rust-lang.org"],
+      "domain_suffix": ["example.net", ".internal.example"],
+      "domain_keyword": ["cdn"],
+      "source_ip_cidr": ["192.0.2.0/24", "2001:db8::/32"],
+      "ip_cidr": ["198.51.100.0/24", "2001:db8:1::/48"],
+      "source_port_range": ["1024:65535"],
+      "port": [80, 443]
+    },
+    {
+      "type": "logical",
+      "mode": "or",
+      "rules": [
+        {"domain_suffix": "example.org"},
+        {"port_range": "8000:9000"}
+      ]
+    }
+  ]
+}

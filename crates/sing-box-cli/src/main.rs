@@ -1,17 +1,16 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use anyhow::Result;
-use sing_box_core::{Engine, Registry, register_builtins};
-use tracing_subscriber::EnvFilter;
+use sing_box_core::{Engine, Registry, RuleSetFetcher, register_builtins};
 
+mod acme;
 mod config_loader;
+mod dns_adapter;
+mod logging;
+mod rule_set_fetcher;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
-
     let sources = match config_loader::parse_args(env::args().skip(1))? {
         config_loader::CliAction::Run(sources) => sources,
         config_loader::CliAction::Help => {
@@ -24,14 +23,23 @@ async fn main() -> Result<()> {
         }
     };
     let loaded = config_loader::load(sources).await?;
+    logging::init(loaded.config.log.as_ref())?;
     tracing::info!(files = loaded.paths.len(), "loaded configuration");
+    let resolver = dns_adapter::build(loaded.config.dns.as_ref())?;
 
     let mut registry = Registry::new();
     register_builtins(&mut registry)?;
+    let http_client = Arc::new(rule_set_fetcher::HttpClient::new());
+    acme::register(&mut registry, Arc::clone(&http_client))?;
     sing_box_protocol_snell::register(&mut registry)?;
     sing_box_protocol_hysteria2::register(&mut registry)?;
 
-    let engine = Engine::new(loaded.config, registry).await?;
+    let rule_set_fetcher = Arc::new(rule_set_fetcher::HttpRuleSetFetcher::with_client(
+        http_client,
+    )) as Arc<dyn RuleSetFetcher>;
+    let engine =
+        Engine::new_with_services(loaded.config, registry, resolver, Some(rule_set_fetcher))
+            .await?;
     engine.start().await?;
     tracing::info!("sing-box-rs started");
     tokio::signal::ctrl_c().await?;

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use sing_box_core::{
     Address, BoxPacketConnection, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle,
     Network, Outbound, OutboundBuildContext, OutboundManagerDialer, Packet, PacketConnection,
-    Registry, Router, Session, StartStage, SystemDialer, bind_tcp_listeners,
+    Registry, Router, Session, StartStage, bind_tcp_listeners, normalize_socket_addr,
 };
 use sing_snell::{
     AcceptedSession, Address as SnellAddress, Client, ClientOptions, ObfsMode, ObfsOptions,
@@ -226,6 +226,7 @@ impl Lifecycle for SnellInbound {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((stream, source)) => {
+                                let source = normalize_socket_addr(source);
                                 let router = Arc::clone(&router);
                                 let server = server.clone();
                                 let tag = tag.clone();
@@ -360,7 +361,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
             }
             let (dialer, dependencies): (Arc<dyn Dialer>, Vec<String>) =
                 if options.detour.is_empty() {
-                    (Arc::new(SystemDialer), Vec::new())
+                    (Arc::new(context.system_dialer), Vec::new())
                 } else {
                     (
                         Arc::new(OutboundManagerDialer::new(

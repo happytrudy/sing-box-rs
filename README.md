@@ -15,6 +15,13 @@ feature replacement for sing-box.
 - four-stage service lifecycle and reverse-order shutdown
 - outbound dependency validation and cycle detection
 - TCP and UDP sessions, routing, and bidirectional relay
+- ordered route, route-options, reject, rule-set, and final actions
+- inline/local/remote source rule-sets and official sing-box SRS binary files
+- transactional local rule-set hot reload and remote ETag-based periodic updates
+- shared certificate-provider registry with tag-based protocol references
+- ACME certificate provider with Cloudflare DNS-01, persistent cache, and renewal
+- external UDP DNS resolver with IPv4/IPv6 strategies and TTL cache
+- configurable logging, NTP offset measurement, direct and block outbounds
 - TCP/UDP `direct` outbound with IPv4 and IPv6 sockets
 - SOCKS5 CONNECT and UDP ASSOCIATE inbound
 - external Snell inbound/outbound adapter
@@ -42,6 +49,7 @@ path dependency:
 ```text
 ../sing-snell-rs
 ../sing-quic-rs
+../sing-dns-rs
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the extension contract.
@@ -94,6 +102,115 @@ each directory, sorts all paths, recursively merges objects, and appends
 arrays. This keeps inbounds in independent files while outbounds and routing
 remain in the base configuration.
 
+`examples/modular/config.json` is a fuller base configuration covering file
+logging, UDP DNS, NTP, source/binary/inline rule-sets, ordered rules,
+direct/block outbounds, plus commented remote rule-set and ACME provider
+templates. Inbounds remain exclusively under `examples/modular/conf`.
+
+An advanced base configuration with UDP DNS, local source rule-set client
+authorization, ordered route/reject actions, NTP, file logging, direct, and
+block outbounds is available at `examples/advanced/config.json`. It can be
+combined with the modular Hysteria2 inbound:
+
+```bash
+cargo run -p sing-box-rs -- run \
+  -c examples/advanced/config.json \
+  -C examples/modular/conf
+```
+
+### Rule-sets
+
+Local rule-sets support source JSON and official sing-box `.srs` binaries. The
+format may be explicit or inferred from the `.json`/`.srs` suffix. Local files
+are watched while the engine is running; a changed file is parsed and compiled
+before its active snapshot is replaced. Invalid updates are logged and the
+last valid snapshot remains active.
+
+```json
+{
+  "type": "local",
+  "tag": "local-example",
+  "path": "examples/rule-set/compat.srs"
+}
+```
+
+Remote rule-sets use HTTP or HTTPS. The first download must succeed before the
+engine starts. Later downloads use `If-None-Match` when the server supplied an
+ETag, and replace the active snapshot only after successful validation. The
+default update interval is 24 hours.
+
+```json
+{
+  "type": "remote",
+  "tag": "remote-example",
+  "format": "binary",
+  "url": "https://example.com/path/to/rules.srs",
+  "update_interval": "6h"
+}
+```
+
+See `examples/rule-set/local-binary.json` and
+`examples/rule-set/remote-binary.json`. The checked-in `compat.srs` fixture was
+compiled by the official Go sing-box implementation from `compat.json`:
+
+```bash
+sing-box rule-set compile examples/rule-set/compat.json \
+  -o examples/rule-set/compat.srs
+```
+
+### Certificate providers
+
+Certificate providers are shared runtime services. Protocols reference them by
+tag, so ACME account handling, DNS challenges, storage, and renewal remain
+independent of Hysteria2 or any future TLS protocol. Providers start before
+certificate consumers and stop after them. Updated certificates are published
+to subscribers without interrupting existing connections.
+
+The first provider implementation supports Let's Encrypt and custom HTTPS ACME
+directories with Cloudflare DNS-01. It stores account credentials and an atomic
+certificate/key bundle under `data_directory/sing-box-rs/<tag>`, uses cached
+certificates across restarts, and starts renewal 30 days before expiration.
+
+```json
+{
+  "certificate_providers": [
+    {
+      "type": "acme",
+      "tag": "example-certificate",
+      "domain": "h.example.com",
+      "email": "admin@example.com",
+      "data_directory": "acme",
+      "dns01_challenge": {
+        "provider": "cloudflare",
+        "api_token": "${CLOUDFLARE_API_TOKEN}"
+      }
+    }
+  ]
+}
+```
+
+Set the token outside the configuration and reference it exactly as shown:
+
+```bash
+export CLOUDFLARE_API_TOKEN='replace-with-a-zone-scoped-token'
+cargo run -p sing-box-rs -- run \
+  -c examples/certificate-provider/acme-cloudflare.json
+```
+
+The token requires Cloudflare Zone DNS Edit and Zone Read access for the
+certificate's zone. Hysteria2 is the first certificate consumer:
+
+```json
+{
+  "tls": {
+    "enabled": true,
+    "alpn": ["h3"],
+    "server_name": "h.example.com",
+    "certificate_provider": "example-certificate"
+  }
+}
+```
+
 Inbound `listen` semantics are shared by every protocol: `0.0.0.0` is
 IPv4-only, `::` listens on all IPv6 and IPv4 interfaces, and `::1` binds both
 the IPv6 and IPv4 loopback addresses. A full endpoint such as
@@ -105,7 +222,51 @@ limits. Positive negotiated rates use Brutal; leaving both at zero keeps BBR.
 When server bandwidth is unset, `ignore_client_bandwidth` forces BBR. When it
 is set, the option rejects clients that request BBR, matching sing-box.
 
-Set `RUST_LOG=debug` to inspect routing and handshake failures.
+Hysteria2 masquerade handles ordinary HTTP/3 requests and failed
+authentication attempts. Without it the server returns 404. The sing-box URL
+short forms provide a file server or reverse proxy:
+
+```json
+"masquerade": "file:///var/www"
+```
+
+```json
+"masquerade": "http://127.0.0.1:8080"
+```
+
+The equivalent object forms add host rewriting and fixed responses:
+
+```json
+"masquerade": {
+  "type": "proxy",
+  "url": "https://www.example.com/base",
+  "rewrite_host": true
+}
+```
+
+```json
+"masquerade": {
+  "type": "file",
+  "directory": "/var/www"
+}
+```
+
+```json
+"masquerade": {
+  "type": "string",
+  "status_code": 200,
+  "headers": {
+    "content-type": "text/html; charset=utf-8"
+  },
+  "content": "<!doctype html><title>Welcome</title>"
+}
+```
+
+The listener remains UDP/QUIC only. A TCP-only HTTPS client will not reach the
+masquerade handler; use an HTTP/3-capable client when testing it directly.
+
+Set `RUST_LOG=debug` to inspect routing, rule-set update, and handshake
+failures.
 
 ## Configuration
 
@@ -130,7 +291,7 @@ deserializes the remaining JSON into the protocol crate's own option type.
     }
   ],
   "route": {
-    "final_outbound": "direct"
+    "final": "direct"
   }
 }
 ```
@@ -142,9 +303,16 @@ value of `"http"` or `"tls"` plus an optional `"obfs_host"`.
 
 ## Current limitations
 
-- one final outbound route; rule matching and sniffing are not implemented
-- no DNS subsystem, TUN endpoint, endpoint registry, or service registry
-- no hot reload or connection tracking
+- route sniffing is not implemented
+- binary rule items requiring unavailable process, package, interface, Wi-Fi,
+  AdGuard, regular-expression, or DNS query metadata are rejected
+- remote rule-set cache persistence, `download_detour`, and custom
+  `http_client` options are not implemented
+- ACME currently supports P-256 certificates and Cloudflare DNS-01; HTTP-01,
+  TLS-ALPN-01, EAB, other DNS providers, and custom ACME HTTP clients are not implemented
+- DNS currently supports UDP servers and address lookup; DNS rules, TCP/TLS/
+  HTTPS/QUIC transports, fake IP, and hijack-dns are not implemented
+- no TUN endpoint, endpoint registry, service registry, or connection tracking
 - SOCKS authentication and BIND are not implemented
 - Hysteria2 UDP forwarding, obfuscation, port hopping, TUIC, and legacy
   Hysteria are not implemented yet

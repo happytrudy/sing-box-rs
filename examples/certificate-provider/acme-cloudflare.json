@@ -1,0 +1,47 @@
+{
+  "certificate_providers": [
+    {
+      "type": "acme",
+      "tag": "example-certificate",
+      "domain": "h.example.com",
+      "email": "admin@example.com",
+      "data_directory": "acme",
+      "dns01_challenge": {
+        "provider": "cloudflare",
+        "api_token": "${CLOUDFLARE_API_TOKEN}"
+      }
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 21835,
+      "users": [
+        {
+          "name": "default",
+          "password": "change-this-password"
+        }
+      ],
+      "up_mbps": 1000,
+      "down_mbps": 1000,
+      "masquerade": "http://127.0.0.1:8080",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "server_name": "h.example.com",
+        "certificate_provider": "example-certificate"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

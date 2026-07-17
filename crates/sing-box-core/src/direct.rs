@@ -3,7 +3,7 @@ use std::{net::IpAddr, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::net::{UdpSocket, lookup_host};
+use tokio::net::UdpSocket;
 
 use crate::{
     Address, BoxPacketConnection, BoxStream, Dialer, Lifecycle, Outbound, OutboundBuildContext,
@@ -16,6 +16,7 @@ struct DirectOptions {}
 
 struct DirectOutbound {
     tag: String,
+    dialer: SystemDialer,
 }
 
 impl Lifecycle for DirectOutbound {}
@@ -23,7 +24,7 @@ impl Lifecycle for DirectOutbound {}
 #[async_trait]
 impl Dialer for DirectOutbound {
     async fn connect(&self, session: &Session) -> Result<BoxStream> {
-        SystemDialer.connect(session).await
+        self.dialer.connect(session).await
     }
 }
 
@@ -40,20 +41,27 @@ impl Outbound for DirectOutbound {
     async fn connect_packet(&self, _session: &Session) -> Result<BoxPacketConnection> {
         let ipv4 = UdpSocket::bind("0.0.0.0:0").await?;
         let ipv6 = UdpSocket::bind("[::]:0").await.ok();
-        Ok(Arc::new(DirectPacketConnection { ipv4, ipv6 }))
+        Ok(Arc::new(DirectPacketConnection {
+            ipv4,
+            ipv6,
+            dialer: self.dialer.clone(),
+        }))
     }
 }
 
 struct DirectPacketConnection {
     ipv4: UdpSocket,
     ipv6: Option<UdpSocket>,
+    dialer: SystemDialer,
 }
 
 #[async_trait]
 impl PacketConnection for DirectPacketConnection {
     async fn send(&self, packet: Packet) -> Result<()> {
-        let addresses =
-            lookup_host((packet.destination.host.as_str(), packet.destination.port)).await?;
+        let addresses = self
+            .dialer
+            .resolve(&packet.destination.host, packet.destination.port)
+            .await?;
         let mut last_error = None;
         for destination in addresses {
             let socket = match destination {
@@ -113,8 +121,11 @@ impl PacketConnection for DirectPacketConnection {
 pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     registry.register_outbound::<DirectOptions, _, _>(
         "direct",
-        |_context: OutboundBuildContext, tag, _options| async move {
-            Ok(Arc::new(DirectOutbound { tag }) as Arc<dyn Outbound>)
+        |context: OutboundBuildContext, tag, _options| async move {
+            Ok(Arc::new(DirectOutbound {
+                tag,
+                dialer: context.system_dialer,
+            }) as Arc<dyn Outbound>)
         },
     )
 }

@@ -7,16 +7,20 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
+http.workspace = true
+rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
 sing-box-core = { path = "../sing-box-core" }
 sing-quic.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
 serde_json.workspace = true
 tempfile = "3"
-

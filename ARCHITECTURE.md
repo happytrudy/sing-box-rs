@@ -114,3 +114,48 @@ order. Shutdown uses the reverse order.
 
 Factories are called before services start. No registry or manager lock is held
 while a factory, lifecycle callback, network dial, or relay is awaited.
+
+## Shared services
+
+DNS wire logic, UDP transport, address-family strategy, and caching live in
+the sibling `sing-dns-rs` project. `sing-box-core` defines only the
+`DomainResolver` interface and injects it into outbound build contexts. Direct,
+Snell, and Hysteria2 therefore share configured DNS without depending on its
+implementation.
+
+Route rules are compiled after outbounds and the initial rule-set snapshots are
+loaded, but before inbounds are built. Non-final `route-options` actions mutate
+the session and continue matching; `route` and `reject` actions terminate rule
+evaluation.
+
+Rule-set storage uses immutable compiled snapshots behind a short-lived read
+lock. Local watchers and remote updaters fully decode and compile the next
+source before swapping the snapshot, so routing never observes a partially
+loaded rule-set and failed updates preserve the last valid version. Remote
+transport is injected through the core `RuleSetFetcher` interface; HTTP, TLS,
+redirect, and ETag handling stays in the CLI composition layer.
+
+The binary decoder implements the official `SRS` header, zlib payload, domain
+succinct-set, IP range-set, default-rule, and logical-rule layouts. It returns
+an explicit error for item types that the current `Session` model cannot match
+correctly instead of dropping those constraints.
+
+## Certificate providers
+
+Certificate providers are shared services owned by `sing-box-core`, never by a
+specific protocol. The core defines `CertificateProvider`, its typed factory
+registry, tag-indexed manager, lifecycle ordering, and certificate update
+subscription. Provider implementations such as ACME live at the composition
+layer and protocols only consume `Arc<Certificate>` snapshots.
+
+Both `InboundBuildContext` and `OutboundBuildContext` expose the same
+`CertificateProviderManager`. Any current or future component that needs a
+server certificate must accept a `certificate_provider` tag, resolve it through
+that manager, and subscribe to updates. It must not implement ACME, DNS API,
+certificate persistence, or renewal inside the protocol crate.
+
+Providers start at every lifecycle stage before outbounds and inbounds. During
+shutdown, certificate consumers close first and providers close last. A
+provider publishes a complete certificate chain and matching private key as one
+snapshot; consumers apply the new snapshot to future handshakes while existing
+connections continue normally.

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Address, Inbound, InboundBuildContext, Lifecycle, Network, Packet, PacketConnection, Registry,
-    Router, Session, StartStage, bind_tcp_listeners,
+    Router, Session, StartStage, bind_tcp_listeners, normalize_socket_addr,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,6 +71,7 @@ impl Lifecycle for SocksInbound {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((stream, source)) => {
+                                let source = normalize_socket_addr(source);
                                 let router = Arc::clone(&router);
                                 let tag = tag.clone();
                                 tokio::spawn(async move {

@@ -6,10 +6,27 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+instant-acme.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sing-box-core = { path = "../sing-box-core" }
+sing-dns.workspace = true
 sing-box-protocol-hysteria2 = { path = "../sing-box-protocol-hysteria2" }
 sing-box-protocol-snell = { path = "../sing-box-protocol-snell" }
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webpki-roots.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"

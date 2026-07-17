@@ -15,14 +15,24 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+bytes = "1"
 futures = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+http = "1"
+http-body-util = "0.1"
+instant-acme = { version = "0.8.5", default-features = false, features = ["rcgen", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+webpki-roots = "1"
+x509-parser = { version = "0.18", default-features = false }
 sing-snell = { path = "../sing-snell-rs" }
 sing-quic = { path = "../sing-quic-rs" }
+sing-dns = { path = "../sing-dns-rs" }
 rustls-pemfile = "2"

@@ -1,0 +1,24 @@
+{
+  "route": {
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "remote-example",
+        "format": "binary",
+        "url": "https://example.com/path/to/rules.srs",
+        "update_interval": "6h"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "remote-example",
+        "outbound": "direct"
+      }
+    ],
+    "final": "block"
+  },
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"}
+  ]
+}

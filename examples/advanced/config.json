@@ -1,0 +1,74 @@
+{
+  "log": {
+    "disabled": false,
+    "output": "/tmp/sing-box-rs-access.log",
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google",
+        "type": "udp",
+        "server": "2001:4860:4860::8888",
+        "server_port": 53
+      },
+      {
+        "tag": "cloudflare",
+        "type": "udp",
+        "server": "1.1.1.1",
+        "server_port": 53
+      }
+    ],
+    "final": "google",
+    "strategy": "prefer_ipv6",
+    "disable_cache": false,
+    "disable_expire": false
+  },
+  "route": {
+    "default_domain_resolver": {
+      "server": "google"
+    },
+    "rule_set": [
+      {
+        "tag": "client-whitelist",
+        "type": "local",
+        "format": "source",
+        "path": "examples/advanced/ip_whitelist.json"
+      }
+    ],
+    // Rules are evaluated in order.
+    "rules": [
+      {
+        "port": 53,
+        "outbound": "direct"
+      },
+      {
+        "inbound": "hy2-in",
+        "rule_set": "client-whitelist",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "inbound": "hy2-in",
+        "action": "reject",
+        "method": "drop"
+      }
+    ],
+    "final": "direct"
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "tag": "block",
+      "type": "block"
+    }
+  ]
+}
