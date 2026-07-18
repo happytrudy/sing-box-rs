@@ -98,6 +98,12 @@ to the configured camouflage upstream; the upstream certificate and private
 key are never copied locally. Generic certificate providers remain available
 only to protocols that require user-managed certificates.
 
+ShadowQuic congestion control is configured independently on each endpoint.
+BBR is the default. Brutal uses `bandwidth_mbps` as that endpoint's send rate,
+so an inbound controls server-to-client traffic and an outbound controls
+client-to-server traffic. The adapter converts Mbps to bytes per second and
+passes the protocol-neutral configuration to `sing-quic-rs`.
+
 ## Inbound listen addresses
 
 Every inbound protocol must accept both IPv4 and IPv6 address literals in its

@@ -9,6 +9,11 @@
       "jls_upstream": {
         "addr": "camouflage.example.com:443"
       },
+      "congestion_control": {
+        "type": "brutal",
+        "bandwidth_mbps": 100,
+        "disable_loss_compensation": false
+      },
       "users": [
         {
           "name": "demo",

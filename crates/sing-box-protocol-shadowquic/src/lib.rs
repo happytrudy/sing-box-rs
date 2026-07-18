@@ -10,7 +10,10 @@ use sing_box_core::{
     Address, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Outbound,
     OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
 };
-use sing_quic::shadowquic::{Client, ClientOptions, Server, ServerOptions, User as ShadowQuicUser};
+use sing_quic::shadowquic::{
+    Client, ClientOptions, CongestionConfig as ShadowQuicCongestionConfig, Server, ServerOptions,
+    User as ShadowQuicUser,
+};
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -22,12 +25,50 @@ struct ShadowQuicOutboundOptions {
     username: String,
     password: String,
     server_name: String,
+    #[serde(default)]
+    congestion_control: CongestionControlOptions,
     #[serde(default = "default_zero_rtt")]
     zero_rtt: bool,
 }
 
 fn default_zero_rtt() -> bool {
     true
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum CongestionControlOptions {
+    #[default]
+    Bbr,
+    Brutal {
+        bandwidth_mbps: u64,
+        #[serde(default)]
+        disable_loss_compensation: bool,
+    },
+}
+
+impl CongestionControlOptions {
+    fn into_protocol(self) -> Result<ShadowQuicCongestionConfig> {
+        match self {
+            Self::Bbr => Ok(ShadowQuicCongestionConfig::Bbr),
+            Self::Brutal {
+                bandwidth_mbps,
+                disable_loss_compensation,
+            } => {
+                anyhow::ensure!(
+                    bandwidth_mbps > 0,
+                    "ShadowQuic Brutal bandwidth must be positive"
+                );
+                let bytes_per_second = bandwidth_mbps
+                    .checked_mul(125_000)
+                    .context("ShadowQuic Brutal bandwidth is too large")?;
+                Ok(ShadowQuicCongestionConfig::Brutal {
+                    bytes_per_second,
+                    disable_loss_compensation,
+                })
+            }
+        }
+    }
 }
 
 struct ShadowQuicOutbound {
@@ -80,6 +121,8 @@ struct ShadowQuicInboundOptions {
     jls_upstream: Option<JlsUpstreamOptions>,
     #[serde(default = "default_zero_rtt")]
     zero_rtt: bool,
+    #[serde(default)]
+    congestion_control: CongestionControlOptions,
     users: Vec<UserOptions>,
 }
 
@@ -114,6 +157,7 @@ struct ServerProtocolOptions {
     server_name: Option<String>,
     jls_upstream_addr: Option<String>,
     jls_rate_limit: u64,
+    congestion: ShadowQuicCongestionConfig,
     zero_rtt: bool,
 }
 
@@ -157,6 +201,7 @@ impl Lifecycle for ShadowQuicInbound {
                 server_name: protocol.server_name.clone(),
                 jls_upstream_addr: protocol.jls_upstream_addr.clone(),
                 jls_rate_limit: protocol.jls_rate_limit,
+                congestion: protocol.congestion,
                 zero_rtt: protocol.zero_rtt,
             }) {
                 Ok(server) => Arc::new(server),
@@ -282,6 +327,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 server_name: options.server_name,
                 username: options.username,
                 password: options.password,
+                congestion: options.congestion_control.into_protocol()?,
                 zero_rtt: options.zero_rtt,
             })?;
             Ok(Arc::new(ShadowQuicOutbound {
@@ -311,6 +357,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 .jls_upstream
                 .map(|upstream| (Some(upstream.addr), upstream.rate_limit))
                 .unwrap_or((None, u64::MAX));
+            let congestion = options.congestion_control.into_protocol()?;
             Ok(Arc::new(ShadowQuicInbound {
                 tag,
                 prepared: Mutex::new(Some(PreparedServer {
@@ -320,6 +367,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                         server_name,
                         jls_upstream_addr,
                         jls_rate_limit,
+                        congestion,
                         zero_rtt: options.zero_rtt,
                     },
                 })),
@@ -330,4 +378,42 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_brutal_megabits_to_bytes_per_second() {
+        let congestion = CongestionControlOptions::Brutal {
+            bandwidth_mbps: 100,
+            disable_loss_compensation: false,
+        }
+        .into_protocol()
+        .unwrap();
+
+        assert_eq!(
+            congestion,
+            ShadowQuicCongestionConfig::Brutal {
+                bytes_per_second: 12_500_000,
+                disable_loss_compensation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_brutal_bandwidth() {
+        let error = CongestionControlOptions::Brutal {
+            bandwidth_mbps: 0,
+            disable_loss_compensation: false,
+        }
+        .into_protocol()
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ShadowQuic Brutal bandwidth must be positive"
+        );
+    }
 }
