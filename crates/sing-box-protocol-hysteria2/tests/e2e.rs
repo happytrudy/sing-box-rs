@@ -49,6 +49,7 @@ impl CertificateProvider for TestProvider {
 
 #[tokio::test]
 async fn hysteria2_source_whitelist_hot_reload_is_fail_closed() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let echo_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let echo_addr = echo_listener.local_addr()?;
     let echo_connections = Arc::new(AtomicUsize::new(0));

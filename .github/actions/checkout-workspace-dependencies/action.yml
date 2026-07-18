@@ -1,0 +1,43 @@
+name: Checkout workspace dependencies
+description: Checkout sing-box-rs path dependencies from happytrudy repositories
+
+inputs:
+  ref:
+    description: Git ref shared by the dependency repositories
+    required: false
+    default: master
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout happytrudy/sing-quic-rs
+      uses: actions/checkout@v7
+      with:
+        repository: happytrudy/sing-quic-rs
+        ref: ${{ inputs.ref }}
+        path: sing-quic-rs
+        persist-credentials: false
+
+    - name: Checkout happytrudy/sing-snell-rs
+      uses: actions/checkout@v7
+      with:
+        repository: happytrudy/sing-snell-rs
+        ref: ${{ inputs.ref }}
+        path: sing-snell-rs
+        persist-credentials: false
+
+    - name: Checkout happytrudy/sing-dns-rs
+      uses: actions/checkout@v7
+      with:
+        repository: happytrudy/sing-dns-rs
+        ref: ${{ inputs.ref }}
+        path: sing-dns-rs
+        persist-credentials: false
+
+    - name: Checkout happytrudy/rustls-reality
+      uses: actions/checkout@v7
+      with:
+        repository: happytrudy/rustls-reality
+        ref: ${{ inputs.ref }}
+        path: rustls-reality
+        persist-credentials: false

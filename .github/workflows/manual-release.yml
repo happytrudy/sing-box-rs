@@ -86,29 +86,10 @@ jobs:
           path: sing-box-rs
           persist-credentials: false
 
-      - name: Checkout happytrudy/sing-quic-rs
-        uses: actions/checkout@v7
+      - name: Checkout workspace dependencies
+        uses: ./sing-box-rs/.github/actions/checkout-workspace-dependencies
         with:
-          repository: happytrudy/sing-quic-rs
           ref: master
-          path: sing-quic-rs
-          persist-credentials: false
-
-      - name: Checkout happytrudy/sing-snell-rs
-        uses: actions/checkout@v7
-        with:
-          repository: happytrudy/sing-snell-rs
-          ref: master
-          path: sing-snell-rs
-          persist-credentials: false
-
-      - name: Checkout happytrudy/sing-dns-rs
-        uses: actions/checkout@v7
-        with:
-          repository: happytrudy/sing-dns-rs
-          ref: master
-          path: sing-dns-rs
-          persist-credentials: false
 
       - name: Install stable Rust
         shell: bash
@@ -147,29 +128,10 @@ jobs:
           path: sing-box-rs
           persist-credentials: false
 
-      - name: Checkout happytrudy/sing-quic-rs
-        uses: actions/checkout@v7
+      - name: Checkout workspace dependencies
+        uses: ./sing-box-rs/.github/actions/checkout-workspace-dependencies
         with:
-          repository: happytrudy/sing-quic-rs
           ref: master
-          path: sing-quic-rs
-          persist-credentials: false
-
-      - name: Checkout happytrudy/sing-snell-rs
-        uses: actions/checkout@v7
-        with:
-          repository: happytrudy/sing-snell-rs
-          ref: master
-          path: sing-snell-rs
-          persist-credentials: false
-
-      - name: Checkout happytrudy/sing-dns-rs
-        uses: actions/checkout@v7
-        with:
-          repository: happytrudy/sing-dns-rs
-          ref: master
-          path: sing-dns-rs
-          persist-credentials: false
 
       - name: Install stable Rust
         shell: bash
@@ -207,6 +169,7 @@ jobs:
             echo "sing-quic-rs=$(git -C sing-quic-rs rev-parse HEAD)"
             echo "sing-snell-rs=$(git -C sing-snell-rs rev-parse HEAD)"
             echo "sing-dns-rs=$(git -C sing-dns-rs rev-parse HEAD)"
+            echo "rustls-reality=$(git -C rustls-reality rev-parse HEAD)"
           } > "staging/$package/BUILD-INFO.txt"
 
           tar -C staging -czf "dist/$package.tar.gz" "$package"
