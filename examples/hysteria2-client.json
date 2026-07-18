@@ -16,6 +16,8 @@
       "password": "change-this-password",
       "up_mbps": 100,
       "down_mbps": 100,
+      "disable_loss_compensation": false,
+      "brutal_debug": false,
       "tls": {
         "server_name": "localhost",
         "certificate_path": "examples/hysteria2-cert.pem"

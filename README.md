@@ -219,8 +219,15 @@ the IPv6 and IPv4 loopback addresses. A full endpoint such as
 
 Hysteria2 `up_mbps` and `down_mbps` configure the local send and receive
 limits. Positive negotiated rates use Brutal; leaving both at zero keeps BBR.
-When server bandwidth is unset, `ignore_client_bandwidth` forces BBR. When it
-is set, the option rejects clients that request BBR, matching sing-box.
+`ignore_client_bandwidth` ignores client bandwidth hints and keeps both sides
+on their configured non-Brutal controller; it does not reject BBR clients.
+For example, a server configured at 1000/1000 Mbps and a client configured at
+30 Mbps upload and 100 Mbps download negotiate Brutal at 30 Mbps client-to-
+server and 100 Mbps server-to-client.
+`disable_loss_compensation` keeps the configured send rate instead of raising
+it to compensate for packet loss, which is useful behind a hard bandwidth
+policer. `brutal_debug` logs RTT, congestion window, MTU, packet loss, and
+measured send/receive Mbps every two seconds for each active QUIC connection.
 
 Hysteria2 masquerade handles ordinary HTTP/3 requests and failed
 authentication attempts. Without it the server returns 404. The sing-box URL

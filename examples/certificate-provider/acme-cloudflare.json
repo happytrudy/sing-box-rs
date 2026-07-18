@@ -26,6 +26,8 @@
       ],
       "up_mbps": 1000,
       "down_mbps": 1000,
+      "disable_loss_compensation": false,
+      "brutal_debug": false,
       "masquerade": "http://127.0.0.1:8080",
       "tls": {
         "enabled": true,

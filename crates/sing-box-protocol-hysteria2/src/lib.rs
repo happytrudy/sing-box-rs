@@ -31,6 +31,10 @@ struct Hysteria2OutboundOptions {
     up_mbps: u64,
     #[serde(default)]
     down_mbps: u64,
+    #[serde(default)]
+    disable_loss_compensation: bool,
+    #[serde(default)]
+    brutal_debug: bool,
     tls: OutboundTlsOptions,
 }
 
@@ -91,6 +95,10 @@ struct Hysteria2InboundOptions {
     down_mbps: u64,
     #[serde(default)]
     ignore_client_bandwidth: bool,
+    #[serde(default)]
+    disable_loss_compensation: bool,
+    #[serde(default)]
+    brutal_debug: bool,
     #[serde(default)]
     masquerade: Option<masquerade::MasqueradeOptions>,
     tls: InboundTlsOptions,
@@ -388,6 +396,8 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 ClientBandwidth {
                     send_bps: mbps_to_bps(options.up_mbps)?,
                     receive_bps: mbps_to_bps(options.down_mbps)?,
+                    disable_loss_compensation: options.disable_loss_compensation,
+                    brutal_debug: options.brutal_debug,
                 },
             )?;
             Ok(Arc::new(Hysteria2Outbound {
@@ -451,6 +461,8 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     send_bps: mbps_to_bps(options.up_mbps)?,
                     receive_bps: mbps_to_bps(options.down_mbps)?,
                     ignore_client_bandwidth: options.ignore_client_bandwidth,
+                    disable_loss_compensation: options.disable_loss_compensation,
+                    brutal_debug: options.brutal_debug,
                 },
                 masquerade,
             };
