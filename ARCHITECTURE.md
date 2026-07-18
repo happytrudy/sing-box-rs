@@ -91,6 +91,13 @@ ShadowQuic follows this boundary as `sing-quic-rs/src/shadowquic/` and
 and its authentication result is carried through the local `quinn-proto`
 adapter; no ShadowQuic Git repository is a runtime dependency.
 
+ShadowQuic does not expose certificate configuration. Its QUIC server creates
+an ephemeral self-signed certificate in memory to complete the TLS state
+machine for JLS-authenticated clients. Failed JLS authentication is forwarded
+to the configured camouflage upstream; the upstream certificate and private
+key are never copied locally. Generic certificate providers remain available
+only to protocols that require user-managed certificates.
+
 ## Inbound listen addresses
 
 Every inbound protocol must accept both IPv4 and IPv6 address literals in its

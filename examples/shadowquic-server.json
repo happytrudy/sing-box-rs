@@ -14,14 +14,7 @@
           "name": "demo",
           "password": "replace-with-a-long-password"
         }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "server_name": "camouflage.example.com",
-        "certificate_path": "/etc/sing-box/fullchain.crt",
-        "key_path": "/etc/sing-box/private.key"
-      }
+      ]
     }
   ],
   "outbounds": [

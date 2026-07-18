@@ -7,12 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
 serde.workspace = true
 sing-box-core = { path = "../sing-box-core" }
 sing-quic.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-

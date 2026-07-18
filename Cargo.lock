@@ -1650,8 +1650,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "rustls",
- "rustls-pemfile",
  "serde",
  "sing-box-core",
  "sing-quic",
@@ -1758,10 +1756,12 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "rand 0.8.7",
+ "rcgen",
  "rustls",
  "thiserror",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
