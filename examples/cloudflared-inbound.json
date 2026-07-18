@@ -1,0 +1,27 @@
+{
+  "inbounds": [
+    {
+      "type": "cloudflared",
+      "tag": "cloudflared-in",
+      "token": "<base64-cloudflared-tunnel-token>",
+      "protocol": "quic",
+      "ha_connections": 4,
+      "edge_ip_version": 4,
+      "post_quantum": false,
+      "datagram_version": "v3"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

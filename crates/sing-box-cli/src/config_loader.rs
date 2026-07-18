@@ -18,11 +18,16 @@ pub enum CliAction {
     Run(ConfigSources),
     Help,
     Version,
+    GenerateRealityKeypair,
 }
 
 pub const HELP: &str = r#"sing-box-rs - A modular proxy platform
 
-Usage: sing-box-rs [run] [OPTIONS] [CONFIG]
+Usage: sing-box-rs <COMMAND> [OPTIONS] [CONFIG]
+
+Commands:
+  run                            Run the proxy service
+  generate reality-keypair       Generate a new Reality X25519 keypair
 
 Options:
   -c, --config <PATH>              Load a JSON configuration file (repeatable)
@@ -43,6 +48,20 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliActi
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "run" => {}
+            "generate" => {
+                let command = arguments
+                    .next()
+                    .with_context(|| format!("missing command for {argument}"))?;
+                anyhow::ensure!(
+                    command == "reality-keypair",
+                    "unknown generate command: {command}"
+                );
+                anyhow::ensure!(
+                    arguments.next().is_none(),
+                    "unexpected argument after generate reality-keypair"
+                );
+                return Ok(CliAction::GenerateRealityKeypair);
+            }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-v" | "--version" => return Ok(CliAction::Version),
             "-c" | "--config" => files.push(PathBuf::from(
@@ -216,6 +235,11 @@ mod tests {
             CliAction::Version
         ));
         assert!(HELP.contains("--config-directory"));
+        assert!(HELP.contains("generate reality-keypair"));
+        assert!(matches!(
+            parse_args(["generate".to_owned(), "reality-keypair".to_owned()]).unwrap(),
+            CliAction::GenerateRealityKeypair
+        ));
     }
 
     #[test]

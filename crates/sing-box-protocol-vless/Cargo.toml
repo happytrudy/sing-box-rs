@@ -1,0 +1,18 @@
+[package]
+name = "sing-box-protocol-vless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+sing-box-core = { path = "../sing-box-core" }
+sing-box-tls = { path = "../sing-box-tls" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

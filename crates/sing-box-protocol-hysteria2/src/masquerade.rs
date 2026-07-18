@@ -435,9 +435,13 @@ struct ProxyHandler {
 impl ProxyHandler {
     fn new(target: ProxyTarget, rewrite_host: bool, system_dialer: SystemDialer) -> Self {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let tls_config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("configure masquerade TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         Self {
             target,
             rewrite_host,

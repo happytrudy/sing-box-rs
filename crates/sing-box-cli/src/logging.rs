@@ -11,26 +11,19 @@ pub fn init(config: Option<&LogConfig>) -> Result<()> {
     let configured_level = config
         .map(|config| config.level.as_str())
         .filter(|level| !level.is_empty());
-    let level = configured_level.unwrap_or("info");
-    anyhow::ensure!(
-        matches!(level, "trace" | "debug" | "info" | "warn" | "error"),
-        "unknown log level: {level}"
-    );
-    let filter = match configured_level {
-        Some(level) => EnvFilter::try_new(level),
-        None => EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(level)),
-    }
-    .context("create log filter")?;
+    let filter = build_filter(configured_level)?;
     let timestamp = config.is_some_and(|config| config.timestamp);
     let output = config.map_or("", |config| config.output.as_str());
     if output.is_empty() {
         if timestamp {
-            fmt().with_env_filter(filter).finish().try_init()?;
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer())
+                .try_init()?;
         } else {
-            fmt()
-                .with_env_filter(filter)
-                .without_time()
-                .finish()
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().without_time())
                 .try_init()?;
         }
     } else {
@@ -43,29 +36,57 @@ pub fn init(config: Option<&LogConfig>) -> Result<()> {
         );
         let writer = move || file.try_clone().expect("clone log file");
         if timestamp {
-            fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(writer)
-                .finish()
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer())
+                .with(fmt::layer().with_ansi(false).with_writer(writer))
                 .try_init()?;
         } else {
-            fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .without_time()
-                .with_writer(writer)
-                .finish()
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().without_time())
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .without_time()
+                        .with_writer(writer),
+                )
                 .try_init()?;
         }
     }
     Ok(())
 }
 
+fn build_filter(configured_level: Option<&str>) -> Result<EnvFilter> {
+    let level = configured_level.unwrap_or("info");
+    anyhow::ensure!(
+        matches!(level, "trace" | "debug" | "info" | "warn" | "error"),
+        "unknown log level: {level}"
+    );
+    match configured_level {
+        Some(level) => EnvFilter::try_new(level),
+        None => EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(level)),
+    }
+    .context("create log filter")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::SystemTime;
+    use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn configured_level_limits_all_output_layers() {
+        assert_eq!(
+            build_filter(Some("warn")).unwrap().max_level_hint(),
+            Some(LevelFilter::WARN)
+        );
+        assert_eq!(
+            build_filter(Some("info")).unwrap().max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
 
     #[test]
     fn writes_logs_to_the_configured_file() {

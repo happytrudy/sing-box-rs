@@ -1,0 +1,40 @@
+{
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-reality-in",
+      "listen": "::",
+      "listen_port": 14486,
+      "users": [
+        {
+          "name": "dubux",
+          "password": "change-this-password"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "yahoo.com",
+        "alpn": ["h2"],
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "yahoo.com",
+            "server_port": 443
+          },
+          "private_key": "replace-with-a-32-byte-base64url-private-key",
+          "short_id": "1123456789abcdef",
+          "max_time_difference": "1m"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

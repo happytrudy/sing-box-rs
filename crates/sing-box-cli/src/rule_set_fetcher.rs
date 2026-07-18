@@ -75,9 +75,13 @@ pub struct HttpClient {
 impl HttpClient {
     pub fn new() -> Self {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let tls_config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("configure rule-set TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         Self {
             tls_config: Arc::new(tls_config),
         }

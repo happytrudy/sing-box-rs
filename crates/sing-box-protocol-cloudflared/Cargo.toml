@@ -1,0 +1,31 @@
+[package]
+name = "sing-box-protocol-cloudflared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+capnp.workspace = true
+capnp-rpc.workspace = true
+futures.workspace = true
+h2.workspace = true
+http.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sing-box-core = { path = "../sing-box-core" }
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

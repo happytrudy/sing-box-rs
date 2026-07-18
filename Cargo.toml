@@ -4,6 +4,11 @@ members = [
     "crates/sing-box-core",
     "crates/sing-box-protocol-snell",
     "crates/sing-box-protocol-hysteria2",
+    "crates/sing-box-protocol-cloudflared",
+    "crates/sing-box-protocol-vless",
+    "crates/sing-box-protocol-anytls",
+    "crates/sing-box-protocol-shadowquic",
+    "crates/sing-box-tls",
     "crates/sing-box-cli",
 ]
 
@@ -14,20 +19,26 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 anyhow = "1"
+aws-lc-rs = "1.17.0"
 async-trait = "0.1"
 bytes = "1"
+capnp = "0.20"
+capnp-rpc = "0.20"
+h2 = "0.4"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 futures = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 http = "1"
 http-body-util = "0.1"
 instant-acme = { version = "0.8.5", default-features = false, features = ["rcgen", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webpki-roots = "1"
@@ -36,3 +47,7 @@ sing-snell = { path = "../sing-snell-rs" }
 sing-quic = { path = "../sing-quic-rs" }
 sing-dns = { path = "../sing-dns-rs" }
 rustls-pemfile = "2"
+
+[patch.crates-io]
+rustls = { path = "../rustls-reality/rustls" }
+quinn-proto = { path = "../sing-quic-rs/vendor/quinn-proto-jls" }

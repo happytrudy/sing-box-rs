@@ -11,6 +11,7 @@ mod rule_set_fetcher;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let sources = match config_loader::parse_args(env::args().skip(1))? {
         config_loader::CliAction::Run(sources) => sources,
         config_loader::CliAction::Help => {
@@ -19,6 +20,12 @@ async fn main() -> Result<()> {
         }
         config_loader::CliAction::Version => {
             println!("sing-box-rs {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        config_loader::CliAction::GenerateRealityKeypair => {
+            let (private_key, public_key) = sing_box_tls::generate_reality_keypair()?;
+            println!("PrivateKey: {private_key}");
+            println!("PublicKey: {public_key}");
             return Ok(());
         }
     };
@@ -33,6 +40,10 @@ async fn main() -> Result<()> {
     acme::register(&mut registry, Arc::clone(&http_client))?;
     sing_box_protocol_snell::register(&mut registry)?;
     sing_box_protocol_hysteria2::register(&mut registry)?;
+    sing_box_protocol_shadowquic::register(&mut registry)?;
+    sing_box_protocol_cloudflared::register(&mut registry)?;
+    sing_box_protocol_vless::register(&mut registry)?;
+    sing_box_protocol_anytls::register(&mut registry)?;
 
     let rule_set_fetcher = Arc::new(rule_set_fetcher::HttpRuleSetFetcher::with_client(
         http_client,

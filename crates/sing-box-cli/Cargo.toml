@@ -18,7 +18,12 @@ serde_json.workspace = true
 sing-box-core = { path = "../sing-box-core" }
 sing-dns.workspace = true
 sing-box-protocol-hysteria2 = { path = "../sing-box-protocol-hysteria2" }
+sing-box-protocol-shadowquic = { path = "../sing-box-protocol-shadowquic" }
+sing-box-protocol-cloudflared = { path = "../sing-box-protocol-cloudflared" }
 sing-box-protocol-snell = { path = "../sing-box-protocol-snell" }
+sing-box-protocol-vless = { path = "../sing-box-protocol-vless" }
+sing-box-protocol-anytls = { path = "../sing-box-protocol-anytls" }
+sing-box-tls = { path = "../sing-box-tls" }
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true

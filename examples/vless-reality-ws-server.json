@@ -1,0 +1,42 @@
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-ws-in",
+      "listen": "127.0.0.1",
+      "listen_port": 14486,
+      "users": [
+        {
+          "uuid": "d4f2ad1c-f6db-481e-91de-9d551f8885c9"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/assets/js/chunks/main.d4f2ad1c.js",
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "yahoo.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "yahoo.com",
+            "server_port": 443
+          },
+          "private_key": "replace-with-a-32-byte-base64url-private-key",
+          "short_id": "1123456789abcdef"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

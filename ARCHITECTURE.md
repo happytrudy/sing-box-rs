@@ -65,6 +65,7 @@ let mut registry = Registry::new();
 register_builtins(&mut registry)?;
 sing_box_protocol_snell::register(&mut registry)?;
 sing_box_protocol_hysteria2::register(&mut registry)?;
+sing_box_protocol_shadowquic::register(&mut registry)?;
 ```
 
 Registration is explicit on purpose. It works on desktop, mobile, and WASM
@@ -84,6 +85,11 @@ A new protocol crate normally contains:
 Wire logic should remain in a separate reusable library. The adapter should
 only translate configuration and connect the library to listeners, dialers,
 sessions, routing, logging, and lifecycle management.
+
+ShadowQuic follows this boundary as `sing-quic-rs/src/shadowquic/` and
+`sing-box-protocol-shadowquic`. JLS is implemented in the local Rustls fork
+and its authentication result is carried through the local `quinn-proto`
+adapter; no ShadowQuic Git repository is a runtime dependency.
 
 ## Inbound listen addresses
 

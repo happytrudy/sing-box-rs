@@ -28,6 +28,9 @@ feature replacement for sing-box.
 - Snell v4/v5 legacy and v6 default/unshaped/unsafe-raw modes
 - Snell authenticated TCP, UDP, connection reuse, replay protection, and obfs
 - external Hysteria2 inbound/outbound adapter backed by `sing-quic-rs`
+- AnyTLS TLS inbound/outbound adapter with password authentication and TCP session multiplexing
+- VLESS WebSocket TCP inbound with UUID authentication and early data
+- Cloudflared remote-managed HTTP/2 inbound with Cap'n Proto registration
 - Hysteria2 HTTP/3 authentication and multiplexed TCP streams over QUIC
 - Hysteria2 BBR default and negotiated Brutal congestion control
 - PEM and DER certificate loading for Hysteria2
@@ -40,6 +43,9 @@ crates/
   sing-box-core/             protocol-neutral API and runtime
   sing-box-protocol-snell/   thin adapter around sing-snell-rs
   sing-box-protocol-hysteria2/ thin adapter around sing-quic-rs
+  sing-box-protocol-vless/   VLESS WebSocket inbound adapter
+  sing-box-protocol-anytls/  AnyTLS TLS multiplexing adapter
+  sing-box-tls/              shared TLS and protocol-neutral Reality adapter
   sing-box-cli/              composition root and executable
 ```
 
@@ -55,6 +61,15 @@ path dependency:
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the extension contract.
 
 ## Run
+
+Generate a REALITY X25519 keypair using the same output format as sing-box:
+
+```bash
+cargo run -p sing-box-rs -- generate reality-keypair
+```
+
+The command prints `PrivateKey: ...` for the server and `PublicKey: ...` for
+clients. Both values use unpadded URL-safe Base64.
 
 Start the server:
 
@@ -217,6 +232,39 @@ the IPv6 and IPv4 loopback addresses. A full endpoint such as
 `127.0.0.1:443` or `[::1]:443` may be used instead of a separate
 `listen_port`.
 
+VLESS currently supports TCP over a WebSocket inbound. The implementation
+validates the configured UUID, WebSocket path, RFC 6455 client masking, and the
+VLESS destination header before handing the stream to the common router. The
+`early_data_header_name` option accepts URL-safe Base64 VLESS request bytes in
+the named HTTP header, matching the V2Ray WebSocket transport. VLESS UDP and
+outbound support are not implemented yet. VLESS and AnyTLS can both select the
+shared `tls.reality` server mode; Reality authentication and fallback are
+implemented in `sing-box-tls`, not in either protocol adapter.
+
+### Reality TLS
+
+The repository pins the official rustls `0.23.42` source through the local
+`../rustls-reality` fork. The fork adds a read-only `Accepted::reality_client_hello`
+view so the shared TLS crate can authenticate the legacy session ID and X25519
+key share before resuming the regular rustls TLS 1.3 state machine. A valid
+client receives a per-connection temporary Ed25519 certificate signed with the
+REALITY AuthKey; an invalid client is relayed to the configured handshake
+server. The same adapter is reusable by VLESS, AnyTLS, and future TLS-based
+protocols.
+
+Cloudflared supports remote-managed tunnel tokens, SRV/DoT edge discovery,
+HTTP/2 and QUIC transports, HA connection rotation, retry-after backoff,
+graceful unregister, and the official Cap'n Proto registration/configuration
+RPCs. TCP, HTTP, and WebSocket streams are routed through the common router;
+HTTP origin requests use the remote ingress snapshot and support URL origins
+and `http_status` services. QUIC Datagram v2 and v3 UDP sessions include
+registration responses, payload limits, idle expiry, and the common packet
+router. QUIC uses the AWS-LC rustls provider and enables the
+X25519+ML-KEM hybrid key exchange when `post_quantum` is true. See
+`examples/cloudflared-inbound.json` for the configuration shape.
+ICMP datagrams are not enabled yet: the current core packet-router contract
+is UDP-oriented and does not expose a raw ICMP socket/NAT mapping.
+
 Hysteria2 `up_mbps` and `down_mbps` configure the local send and receive
 limits. Positive negotiated rates use Brutal; leaving both at zero keeps BBR.
 `ignore_client_bandwidth` ignores client bandwidth hints and keeps both sides
@@ -228,6 +276,17 @@ server and 100 Mbps server-to-client.
 it to compensate for packet loss, which is useful behind a hard bandwidth
 policer. `brutal_debug` logs RTT, congestion window, MTU, packet loss, and
 measured send/receive Mbps every two seconds for each active QUIC connection.
+
+AnyTLS uses the sing-box protocol shape: the inbound accepts `users` and TLS
+certificate files or a shared `certificate_provider` tag; the outbound accepts
+`server`, `server_port`, `password`, TLS options, and string durations such as
+`"30s"` for idle-session cleanup. TCP streams use AnyTLS v2 settings,
+SYN/PSH/FIN/SYNACK frames, SOCKS destination encoding, and the newest idle TLS
+session for multiplexing. UDP uses `sp.v2.udp-over-tcp.arpa` with the sing-box
+UDP-over-TCP v2 packet format. The default and configured padding schemes are
+negotiated by MD5 and applied with `cmdWaste` frames. Padding ranges use the
+existing AWS-LC secure random source without adding a separate random-number
+dependency.
 
 Hysteria2 masquerade handles ordinary HTTP/3 requests and failed
 authentication attempts. Without it the server returns 404. The sing-box URL
