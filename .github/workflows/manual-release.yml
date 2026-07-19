@@ -99,11 +99,11 @@ jobs:
 
       - name: Run workspace tests
         working-directory: sing-box-rs
-        run: cargo test --locked --workspace
+        run: cargo test --workspace
 
       - name: Run strict clippy
         working-directory: sing-box-rs
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     name: Build ${{ matrix.platform }}
@@ -142,7 +142,7 @@ jobs:
 
       - name: Build release binary
         working-directory: sing-box-rs
-        run: cargo build --locked --release --package sing-box-rs --target "${{ matrix.target }}"
+        run: cargo build --release --package sing-box-rs --target "${{ matrix.target }}"
 
       - name: Package release archive
         shell: bash
