@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
     Address, BoxStream, Certificate, Dialer, Inbound, InboundBuildContext, Lifecycle, Network,
-    Outbound, OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
+    Outbound, OutboundBuildContext, Packet, PacketConnection, Registry, Router, Session,
+    StartStage, listen_addresses,
 };
 use sing_quic::Error as SingQuicError;
 use sing_quic::hysteria2::{
-    Client, ClientBandwidth, ClientOptions, Server, ServerBandwidth, ServerOptions,
-    User as Hysteria2User,
+    Accepted, Client, ClientBandwidth, ClientOptions, Hysteria2Packet, Hysteria2PacketConnection,
+    Server, ServerBandwidth, ServerOptions, User as Hysteria2User,
 };
 use tokio::{sync::Mutex, sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -319,26 +320,50 @@ async fn run_server(
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
                     tokio::spawn(async move {
-                        let destination = match Address::new(
-                            accepted.destination.host(),
-                            accepted.destination.port(),
-                        ) {
-                            Ok(destination) => destination,
-                            Err(error) => {
-                                tracing::debug!(%error, "invalid Hysteria2 destination");
-                                return;
+                        let result: Result<()> = async {
+                            match accepted {
+                                Accepted::Stream(accepted) => {
+                                    let destination = Address::new(
+                                        accepted.destination.host(),
+                                        accepted.destination.port(),
+                                    )?;
+                                    let session = Session::inbound(
+                                        Network::Tcp,
+                                        accepted.source,
+                                        destination,
+                                        tag,
+                                        "hysteria2",
+                                        Some(accepted.user),
+                                    );
+                                    router.route(session, Box::new(accepted.stream)).await
+                                }
+                                Accepted::Packet(accepted) => {
+                                    let destination = Address::new(
+                                        accepted.destination.host(),
+                                        accepted.destination.port(),
+                                    )?;
+                                    let session = Session::inbound(
+                                        Network::Udp,
+                                        accepted.source,
+                                        destination,
+                                        tag,
+                                        "hysteria2",
+                                        Some(accepted.user),
+                                    );
+                                    router
+                                        .route_packet(
+                                            session,
+                                            Arc::new(Hysteria2PacketAdapter {
+                                                inner: accepted.connection,
+                                            }),
+                                        )
+                                        .await
+                                }
                             }
-                        };
-                        let session = Session::inbound(
-                            Network::Tcp,
-                            accepted.source,
-                            destination,
-                            tag,
-                            "hysteria2",
-                            Some(accepted.user),
-                        );
-                        if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
-                            tracing::debug!(%error, "Hysteria2 stream closed");
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "Hysteria2 routed session closed");
                         }
                     });
                 }
@@ -348,6 +373,34 @@ async fn run_server(
                 }
             }
         }
+    }
+}
+
+struct Hysteria2PacketAdapter {
+    inner: Arc<Hysteria2PacketConnection>,
+}
+
+#[async_trait]
+impl PacketConnection for Hysteria2PacketAdapter {
+    async fn send(&self, packet: Packet) -> Result<()> {
+        self.inner
+            .send(Hysteria2Packet {
+                data: packet.data,
+                destination: sing_quic::Address::new(
+                    packet.destination.host,
+                    packet.destination.port,
+                )?,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Packet> {
+        let packet = self.inner.recv().await?;
+        Ok(Packet {
+            data: packet.data,
+            destination: Address::new(packet.destination.host(), packet.destination.port())?,
+        })
     }
 }
 
