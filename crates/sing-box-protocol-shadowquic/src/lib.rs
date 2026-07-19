@@ -8,11 +8,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
     Address, BoxStream, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Outbound,
-    OutboundBuildContext, Registry, Router, Session, StartStage, listen_addresses,
+    OutboundBuildContext, Packet, PacketConnection, Registry, Router, Session, StartStage,
+    listen_addresses,
 };
 use sing_quic::shadowquic::{
-    Client, ClientOptions, CongestionConfig as ShadowQuicCongestionConfig, Server, ServerOptions,
-    User as ShadowQuicUser,
+    Accepted, Client, ClientOptions, CongestionConfig as ShadowQuicCongestionConfig, Server,
+    ServerOptions, ShadowQuicPacket, ShadowQuicPacketConnection, User as ShadowQuicUser,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -275,21 +276,78 @@ async fn run_server(
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
                     tokio::spawn(async move {
-                        let destination = Address::new(accepted.destination.host(), accepted.destination.port())?;
-                        let session = Session::inbound(
-                            Network::Tcp,
-                            accepted.source,
-                            destination,
-                            tag,
-                            "shadowquic",
-                            Some(accepted.user),
-                        );
-                        router.route(session, Box::new(accepted.stream)).await
+                        match accepted {
+                            Accepted::Stream(accepted) => {
+                                let destination = Address::new(
+                                    accepted.destination.host(),
+                                    accepted.destination.port(),
+                                )?;
+                                let session = Session::inbound(
+                                    Network::Tcp,
+                                    accepted.source,
+                                    destination,
+                                    tag,
+                                    "shadowquic",
+                                    Some(accepted.user),
+                                );
+                                router.route(session, Box::new(accepted.stream)).await
+                            }
+                            Accepted::Packet(accepted) => {
+                                let destination = Address::new(
+                                    accepted.destination.host(),
+                                    accepted.destination.port(),
+                                )?;
+                                let session = Session::inbound(
+                                    Network::Udp,
+                                    accepted.source,
+                                    destination,
+                                    tag,
+                                    "shadowquic",
+                                    Some(accepted.user),
+                                );
+                                router
+                                    .route_packet(
+                                        session,
+                                        Arc::new(ShadowQuicPacketAdapter {
+                                            inner: accepted.connection,
+                                        }),
+                                    )
+                                    .await
+                            }
+                        }
                     });
                 }
                 Err(error) => { tracing::debug!(%error, "ShadowQuic accept stopped"); break; }
             }
         }
+    }
+}
+
+struct ShadowQuicPacketAdapter {
+    inner: Arc<ShadowQuicPacketConnection>,
+}
+
+#[async_trait]
+impl PacketConnection for ShadowQuicPacketAdapter {
+    async fn send(&self, packet: Packet) -> Result<()> {
+        self.inner
+            .send(ShadowQuicPacket {
+                data: packet.data,
+                destination: sing_quic::Address::new(
+                    packet.destination.host,
+                    packet.destination.port,
+                )?,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Packet> {
+        let packet = self.inner.recv().await?;
+        Ok(Packet {
+            data: packet.data,
+            destination: Address::new(packet.destination.host(), packet.destination.port())?,
+        })
     }
 }
 
