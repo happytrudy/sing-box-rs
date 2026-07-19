@@ -15,7 +15,7 @@ use sing_box_core::{
 use sing_quic::Error as SingQuicError;
 use sing_quic::hysteria2::{
     Accepted, Client, ClientBandwidth, ClientOptions, Hysteria2Packet, Hysteria2PacketConnection,
-    Server, ServerBandwidth, ServerOptions, User as Hysteria2User,
+    QuicTransportOptions, Server, ServerBandwidth, ServerOptions, User as Hysteria2User,
 };
 use tokio::{sync::Mutex, sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,10 @@ struct Hysteria2OutboundOptions {
     disable_loss_compensation: bool,
     #[serde(default)]
     brutal_debug: bool,
+    #[serde(default)]
+    initial_packet_size: u16,
+    #[serde(default)]
+    disable_path_mtu_discovery: bool,
     tls: OutboundTlsOptions,
 }
 
@@ -101,6 +105,10 @@ struct Hysteria2InboundOptions {
     #[serde(default)]
     brutal_debug: bool,
     #[serde(default)]
+    initial_packet_size: u16,
+    #[serde(default)]
+    disable_path_mtu_discovery: bool,
+    #[serde(default)]
     masquerade: Option<masquerade::MasqueradeOptions>,
     tls: InboundTlsOptions,
     users: Vec<UserOptions>,
@@ -145,6 +153,7 @@ struct PreparedServer {
     certificate: CertificateSource,
     users: Vec<Hysteria2User>,
     bandwidth: ServerBandwidth,
+    transport_options: QuicTransportOptions,
     masquerade: Option<Arc<dyn sing_quic::hysteria2::MasqueradeHandler>>,
 }
 
@@ -182,6 +191,7 @@ impl Lifecycle for Hysteria2Inbound {
             certificate,
             users,
             bandwidth,
+            transport_options,
             masquerade,
         } = prepared;
         let (certificate, certificate_updates) = match certificate {
@@ -201,7 +211,7 @@ impl Lifecycle for Hysteria2Inbound {
             if index > 0 && address.port() == 0 {
                 address.set_port(assigned_port);
             }
-            let server = match Server::bind_with_bandwidth_and_masquerade(
+            let server = match Server::bind_with_bandwidth_and_transport_and_masquerade(
                 ServerOptions {
                     listen: address,
                     certificate_chain: certificate.certificate_chain.clone(),
@@ -209,6 +219,7 @@ impl Lifecycle for Hysteria2Inbound {
                     users: users.clone(),
                 },
                 bandwidth,
+                transport_options,
                 masquerade.clone(),
             ) {
                 Ok(server) => Arc::new(server),
@@ -439,7 +450,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 .await
                 .with_context(|| format!("read {}", options.tls.certificate_path))?;
             let certificates = parse_certificates(&certificate_data)?;
-            let client = Client::new_with_bandwidth(
+            let client = Client::new_with_bandwidth_and_transport(
                 ClientOptions {
                     server,
                     server_name: options.tls.server_name,
@@ -451,6 +462,10 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     receive_bps: mbps_to_bps(options.down_mbps)?,
                     disable_loss_compensation: options.disable_loss_compensation,
                     brutal_debug: options.brutal_debug,
+                },
+                QuicTransportOptions {
+                    initial_packet_size: options.initial_packet_size,
+                    disable_path_mtu_discovery: options.disable_path_mtu_discovery,
                 },
             )?;
             Ok(Arc::new(Hysteria2Outbound {
@@ -517,6 +532,10 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     disable_loss_compensation: options.disable_loss_compensation,
                     brutal_debug: options.brutal_debug,
                 },
+                transport_options: QuicTransportOptions {
+                    initial_packet_size: options.initial_packet_size,
+                    disable_path_mtu_discovery: options.disable_path_mtu_discovery,
+                },
                 masquerade,
             };
             Ok(Arc::new(Hysteria2Inbound {
@@ -556,5 +575,40 @@ fn parse_private_key(data: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("private key is empty")
     } else {
         Ok(data.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_quic_transport_options_for_inbound_and_outbound() {
+        let inbound: Hysteria2InboundOptions = serde_json::from_value(serde_json::json!({
+            "listen": "::",
+            "listen_port": 443,
+            "initial_packet_size": 1200,
+            "disable_path_mtu_discovery": true,
+            "tls": { "enabled": true },
+            "users": [{ "password": "secret" }]
+        }))
+        .unwrap();
+        assert_eq!(inbound.initial_packet_size, 1200);
+        assert!(inbound.disable_path_mtu_discovery);
+
+        let outbound: Hysteria2OutboundOptions = serde_json::from_value(serde_json::json!({
+            "server": "example.com",
+            "server_port": 443,
+            "password": "secret",
+            "initial_packet_size": 1200,
+            "disable_path_mtu_discovery": true,
+            "tls": {
+                "server_name": "example.com",
+                "certificate_path": "ca.pem"
+            }
+        }))
+        .unwrap();
+        assert_eq!(outbound.initial_packet_size, 1200);
+        assert!(outbound.disable_path_mtu_discovery);
     }
 }
