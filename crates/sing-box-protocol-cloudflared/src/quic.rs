@@ -529,7 +529,7 @@ fn build_endpoint(post_quantum: bool, edge_is_ipv4: bool) -> Result<Endpoint> {
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
     config.transport_config(Arc::new(transport));
     let bind_address = if edge_is_ipv4 { "0.0.0.0:0" } else { "[::]:0" };
-    let mut endpoint = Endpoint::client(bind_address.parse()?)?;
+    let endpoint = Endpoint::client(bind_address.parse()?)?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
 }

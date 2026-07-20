@@ -244,13 +244,14 @@ implemented in `sing-box-tls`, not in either protocol adapter.
 ### Reality TLS
 
 The repository pins the official rustls `0.23.42` source through the local
-`../rustls-reality` fork. The fork adds a read-only `Accepted::reality_client_hello`
-view so the shared TLS crate can authenticate the legacy session ID and X25519
-key share before resuming the regular rustls TLS 1.3 state machine. A valid
-client receives a per-connection temporary Ed25519 certificate signed with the
-REALITY AuthKey; an invalid client is relayed to the configured handshake
-server. The same adapter is reusable by VLESS, AnyTLS, and future TLS-based
-protocols.
+`../rustls` fork. The fork retains a read-only `Accepted::reality_client_hello`
+view and the JLS handshake hooks while tracking the latest official stable
+rustls release. The shared TLS crate authenticates the legacy session ID and
+X25519 key share before resuming the regular rustls TLS 1.3 state machine. A
+valid client receives a per-connection temporary Ed25519 certificate signed
+with the REALITY AuthKey; an invalid client is relayed to the configured
+handshake server. The same adapter is reusable by VLESS, AnyTLS, and future
+TLS-based protocols.
 
 Cloudflared supports remote-managed tunnel tokens, SRV/DoT edge discovery,
 HTTP/2 and QUIC transports, HA connection rotation, retry-after backoff,

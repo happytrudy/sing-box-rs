@@ -34,10 +34,18 @@ runs:
         path: sing-dns-rs
         persist-credentials: false
 
-    - name: Checkout happytrudy/rustls-reality
+    - name: Checkout happytrudy/quinn
       uses: actions/checkout@v7
       with:
-        repository: happytrudy/rustls-reality
+        repository: happytrudy/quinn
         ref: ${{ inputs.ref }}
-        path: rustls-reality
+        path: quinn
+        persist-credentials: false
+
+    - name: Checkout happytrudy/rustls
+      uses: actions/checkout@v7
+      with:
+        repository: happytrudy/rustls
+        ref: ${{ inputs.ref }}
+        path: rustls
         persist-credentials: false

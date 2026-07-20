@@ -649,8 +649,6 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
 dependencies = [
  "bytes",
  "fastrand",
@@ -663,14 +661,11 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
 dependencies = [
  "bytes",
- "futures",
+ "futures-util",
  "h3",
  "quinn",
- "tokio",
  "tokio-util",
 ]
 
@@ -1118,9 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1139,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.12.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1160,13 +1153,10 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+version = "0.6.1"
 dependencies = [
  "cfg_aliases",
  "libc",
- "once_cell",
  "socket2",
  "tracing",
  "windows-sys 0.61.2",

@@ -169,7 +169,8 @@ jobs:
             echo "sing-quic-rs=$(git -C sing-quic-rs rev-parse HEAD)"
             echo "sing-snell-rs=$(git -C sing-snell-rs rev-parse HEAD)"
             echo "sing-dns-rs=$(git -C sing-dns-rs rev-parse HEAD)"
-            echo "rustls-reality=$(git -C rustls-reality rev-parse HEAD)"
+            echo "quinn=$(git -C quinn rev-parse HEAD)"
+            echo "rustls=$(git -C rustls rev-parse HEAD)"
           } > "staging/$package/BUILD-INFO.txt"
 
           tar -C staging -czf "dist/$package.tar.gz" "$package"
