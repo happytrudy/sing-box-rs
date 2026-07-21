@@ -1098,7 +1098,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Address, config::RuleSetSource, normalize_socket_addr};
+    use crate::{Address, config::RuleSetSource};
 
     fn session(source: &str, destination: &str, port: u16) -> Session {
         Session {
@@ -1286,10 +1286,20 @@ mod tests {
         )));
         assert!(rule_set.matches(&session("117.154.46.9:1234", "example.com", 443)));
 
-        let mapped = normalize_socket_addr("[::ffff:117.154.46.9]:1234".parse().unwrap());
-        let mut mapped_session = session("127.0.0.1:1234", "example.com", 443);
-        mapped_session.source = Some(mapped);
-        assert!(rule_set.matches(&mapped_session));
+        assert!(rule_set.matches(&session("[::ffff:117.154.46.9]:1234", "example.com", 443)));
+
+        let mapped_ipv6_rules = decode_and_compile_rule_set(
+            "mapped-ipv6",
+            RuleSetFormat::Source,
+            br#"{"version":1,"rules":[{"source_ip_cidr":"::ffff:117.154.46.9/128"}]}"#,
+        )
+        .unwrap();
+        let mapped_ipv6_rule_set = CompiledRuleSet::new(mapped_ipv6_rules);
+        assert!(!mapped_ipv6_rule_set.matches(&session(
+            "[::ffff:117.154.46.9]:1234",
+            "example.com",
+            443
+        )));
 
         assert!(!rule_set.matches(&session("117.154.46.10:1234", "example.com", 443)));
     }
