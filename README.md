@@ -103,6 +103,12 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 Then run `examples/hysteria2-server.json` and
 `examples/hysteria2-client.json` in separate terminals.
 
+SunnyQUIC has separate BBR, Brutal, and ACME `certificate_provider` examples:
+`sunnyquic-server-bbr.json`, `sunnyquic-server-brutal.json`,
+`sunnyquic-server-certificate-provider.json`, `sunnyquic-client-bbr.json`, and
+`sunnyquic-client-brutal.json`. SunnyQUIC uses native QUIC TLS and the same
+`listen: "::"` dual-stack behavior as the other inbound protocols.
+
 The server can also be split into a base configuration and protocol-specific
 inbound fragments:
 
@@ -288,6 +294,14 @@ UDP-over-TCP v2 packet format. The default and configured padding schemes are
 negotiated by MD5 and applied with `cmdWaste` frames. Padding ranges use the
 existing AWS-LC secure random source without adding a separate random-number
 dependency.
+
+AnyTLS can also use the JLS TLS camouflage from the Rustls fork used by this
+workspace. Set `enable_jls`, `jls_username`, and `jls_password` in the `tls`
+object on both peers. A JLS inbound may omit certificate files and a provider;
+it generates a temporary certificate for the TLS handshake. Clients using that
+mode should set `insecure: true` unless the server supplies a trusted
+certificate. See `examples/anytls-jls-server.json` and
+`examples/anytls-jls-client.json`.
 
 Hysteria2 masquerade handles ordinary HTTP/3 requests and failed
 authentication attempts. Without it the server returns 404. The sing-box URL

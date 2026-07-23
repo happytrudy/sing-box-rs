@@ -2,6 +2,7 @@ use std::{
     io::Cursor,
     net::SocketAddr,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -21,6 +22,8 @@ use tokio::{sync::Mutex, sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 mod masquerade;
+
+const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,14 +364,16 @@ async fn run_server(
                                         "hysteria2",
                                         Some(accepted.user),
                                     );
-                                    router
-                                        .route_packet(
+                                    let timeout_connection = Arc::clone(&accepted.connection);
+                                    tokio::select! {
+                                        result = router.route_packet(
                                             session,
                                             Arc::new(Hysteria2PacketAdapter {
                                                 inner: accepted.connection,
                                             }),
-                                        )
-                                        .await
+                                        ) => result,
+                                        _ = timeout_connection.wait_inactive(DEFAULT_UDP_TIMEOUT) => Ok(()),
+                                    }
                                 }
                             }
                         }

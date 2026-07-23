@@ -1,5 +1,5 @@
 [package]
-name = "sing-box-protocol-anytls"
+name = "sing-box-protocol-sunnyquic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,19 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-aws-lc-rs.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
 serde.workspace = true
 sing-box-core = { path = "../sing-box-core" }
-sing-box-tls = { path = "../sing-box-tls" }
+sing-quic.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-webpki-roots.workspace = true
-rcgen = "0.14"
-
-[dev-dependencies]
-serde_json.workspace = true
-tempfile = "3"
+rustls-pemfile.workspace = true

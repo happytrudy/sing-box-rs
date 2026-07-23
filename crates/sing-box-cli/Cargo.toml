@@ -19,6 +19,7 @@ sing-box-core = { path = "../sing-box-core" }
 sing-dns.workspace = true
 sing-box-protocol-hysteria2 = { path = "../sing-box-protocol-hysteria2" }
 sing-box-protocol-shadowquic = { path = "../sing-box-protocol-shadowquic" }
+sing-box-protocol-sunnyquic = { path = "../sing-box-protocol-sunnyquic" }
 sing-box-protocol-cloudflared = { path = "../sing-box-protocol-cloudflared" }
 sing-box-protocol-snell = { path = "../sing-box-protocol-snell" }
 sing-box-protocol-vless = { path = "../sing-box-protocol-vless" }

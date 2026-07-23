@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
     sing_box_protocol_snell::register(&mut registry)?;
     sing_box_protocol_hysteria2::register(&mut registry)?;
     sing_box_protocol_shadowquic::register(&mut registry)?;
+    sing_box_protocol_sunnyquic::register(&mut registry)?;
     sing_box_protocol_cloudflared::register(&mut registry)?;
     sing_box_protocol_vless::register(&mut registry)?;
     sing_box_protocol_anytls::register(&mut registry)?;

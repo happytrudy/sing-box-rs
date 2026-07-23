@@ -1,0 +1,32 @@
+{
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-jls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [
+        {
+          "name": "anytls-user",
+          "password": "change-this-anytls-password"
+        }
+      ],
+      "tls": {
+        "enable": true,
+        "server_name": "localhost",
+        "enable_jls": true,
+        "jls_username": "change-this-jls-user",
+        "jls_password": "change-this-jls-password"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final_outbound": "direct"
+  }
+}

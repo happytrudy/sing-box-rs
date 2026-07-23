@@ -1664,6 +1664,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sing-box-protocol-sunnyquic"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "rustls-pemfile",
+ "serde",
+ "sing-box-core",
+ "sing-quic",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "sing-box-protocol-vless"
 version = "0.1.2"
 dependencies = [
@@ -1699,6 +1714,7 @@ dependencies = [
  "sing-box-protocol-hysteria2",
  "sing-box-protocol-shadowquic",
  "sing-box-protocol-snell",
+ "sing-box-protocol-sunnyquic",
  "sing-box-protocol-vless",
  "sing-box-tls",
  "sing-dns",
@@ -1747,7 +1763,9 @@ dependencies = [
  "quinn-proto",
  "rand 0.8.7",
  "rcgen",
+ "ring",
  "rustls",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

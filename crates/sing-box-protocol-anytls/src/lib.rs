@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA256, digest};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use rcgen::generate_simple_self_signed;
 use rustls::{
     ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -167,7 +168,7 @@ fn default_idle_timeout() -> String {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClientTlsOptions {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "enable")]
     enabled: bool,
     #[serde(default)]
     server_name: String,
@@ -175,6 +176,12 @@ struct ClientTlsOptions {
     insecure: bool,
     #[serde(default)]
     certificate_path: String,
+    #[serde(default)]
+    enable_jls: bool,
+    #[serde(default)]
+    jls_username: String,
+    #[serde(default)]
+    jls_password: String,
 }
 
 impl Default for ClientTlsOptions {
@@ -184,6 +191,9 @@ impl Default for ClientTlsOptions {
             server_name: String::new(),
             insecure: false,
             certificate_path: String::new(),
+            enable_jls: false,
+            jls_username: String::new(),
+            jls_password: String::new(),
         }
     }
 }
@@ -243,7 +253,7 @@ struct UserOptions {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerTlsOptions {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "enable")]
     enabled: bool,
     #[serde(default)]
     server_name: String,
@@ -257,6 +267,12 @@ struct ServerTlsOptions {
     alpn: Vec<String>,
     #[serde(default)]
     reality: RealityOptions,
+    #[serde(default)]
+    enable_jls: bool,
+    #[serde(default)]
+    jls_username: String,
+    #[serde(default)]
+    jls_password: String,
 }
 
 impl Default for ServerTlsOptions {
@@ -269,6 +285,9 @@ impl Default for ServerTlsOptions {
             key_path: String::new(),
             alpn: Vec::new(),
             reality: RealityOptions::default(),
+            enable_jls: false,
+            jls_username: String::new(),
+            jls_password: String::new(),
         }
     }
 }
@@ -612,6 +631,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 );
             }
             let (certificate, reality) = if options.tls.reality.enabled {
+                anyhow::ensure!(!options.tls.enable_jls, "AnyTLS JLS conflicts with Reality");
                 anyhow::ensure!(
                     options.tls.certificate_provider.is_empty(),
                     "AnyTLS Reality conflicts with certificate_provider"
@@ -627,6 +647,20 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     system_dialer: context.system_dialer.clone(),
                 })?;
                 (None, Some(Arc::new(reality)))
+            } else if options.tls.certificate_provider.is_empty()
+                && options.tls.certificate_path.is_empty()
+                && options.tls.key_path.is_empty()
+            {
+                anyhow::ensure!(
+                    options.tls.enable_jls,
+                    "AnyTLS TLS requires certificate_provider or certificate_path/key_path"
+                );
+                (
+                    Some(CertificateSource::Static(Arc::new(
+                        generate_jls_certificate()?,
+                    ))),
+                    None,
+                )
             } else if options.tls.certificate_provider.is_empty() {
                 anyhow::ensure!(
                     !options.tls.certificate_path.is_empty() && !options.tls.key_path.is_empty(),
@@ -742,12 +776,14 @@ async fn handle_inbound_connection(
     padding_scheme: PaddingScheme,
 ) -> Result<()> {
     let Some(mut stream) = (match acceptor.as_ref() {
-        ServerAcceptor::Standard(acceptor) => Some(tokio_rustls::TlsStream::Server(
-            acceptor
+        ServerAcceptor::Standard(acceptor) => {
+            let stream = acceptor
                 .accept(stream)
                 .await
-                .context("AnyTLS TLS handshake")?,
-        )),
+                .context("AnyTLS TLS handshake")?;
+            verify_jls_state(stream.get_ref().1.jls_state())?;
+            Some(tokio_rustls::TlsStream::Server(stream))
+        }
         ServerAcceptor::Reality(acceptor) => acceptor.accept(stream).await?,
     }) else {
         return Ok(());
@@ -1034,6 +1070,9 @@ impl ClientSession {
             .connect(server_name, stream)
             .await
             .context("AnyTLS TLS handshake")?;
+        if tls.enable_jls {
+            verify_jls_state(stream.get_ref().1.jls_state())?;
+        }
         let auth_padding = padding.read().await.auth_padding_len();
         let auth_padding = if auth_padding == 0 {
             AUTH_PADDING
@@ -1681,6 +1720,19 @@ fn build_server_config(certificate: &Certificate, tls: &ServerTlsOptions) -> Res
         .iter()
         .map(|value| value.as_bytes().to_vec())
         .collect();
+    if tls.enable_jls {
+        anyhow::ensure!(
+            !tls.jls_username.is_empty() && !tls.jls_password.is_empty(),
+            "AnyTLS JLS requires jls_username and jls_password"
+        );
+        let mut jls = rustls::jls::JlsServerConfig::default()
+            .enable(true)
+            .add_user(tls.jls_password.clone(), tls.jls_username.clone());
+        if !tls.server_name.is_empty() {
+            jls = jls.with_server_name(tls.server_name.clone());
+        }
+        config.jls_config = Arc::new(jls);
+    }
     Ok(config)
 }
 
@@ -1711,7 +1763,34 @@ async fn build_client_config(tls: &ClientTlsOptions) -> Result<ClientConfig> {
             .with_no_client_auth()
     };
     config.alpn_protocols = vec![b"anytls".to_vec()];
+    if tls.enable_jls {
+        anyhow::ensure!(
+            !tls.jls_username.is_empty() && !tls.jls_password.is_empty(),
+            "AnyTLS JLS requires jls_username and jls_password"
+        );
+        config.jls_config = rustls::jls::JlsClientConfig::new(&tls.jls_password, &tls.jls_username);
+    }
     Ok(config)
+}
+
+fn verify_jls_state(state: rustls::jls::JlsState) -> Result<()> {
+    anyhow::ensure!(
+        matches!(
+            state,
+            rustls::jls::JlsState::AuthSuccess(_) | rustls::jls::JlsState::Disabled
+        ),
+        "AnyTLS JLS authentication failed"
+    );
+    Ok(())
+}
+
+fn generate_jls_certificate() -> Result<Certificate> {
+    let certificate = generate_simple_self_signed(vec!["localhost".to_owned()])
+        .context("generate AnyTLS JLS certificate")?;
+    Certificate::new(
+        vec![certificate.cert.der().to_vec()],
+        certificate.signing_key.serialize_der(),
+    )
 }
 
 #[derive(Debug)]
@@ -1819,6 +1898,71 @@ mod tests {
         let scheme = PaddingScheme::parse(&options.padding_scheme.source()).unwrap();
         assert_eq!(scheme.stop, 2);
         assert_eq!(scheme.auth_padding_len(), 30);
+    }
+
+    #[test]
+    fn parses_quicproxy_jls_tls_fields() {
+        let options: AnyTlsInboundOptions = serde_json::from_str(
+            r#"{
+                "users": [{"password": "anytls-password"}],
+                "tls": {
+                    "enable": true,
+                    "server_name": "localhost",
+                    "enable_jls": true,
+                    "jls_username": "jls-user",
+                    "jls_password": "jls-password"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(options.tls.enabled);
+        assert!(options.tls.enable_jls);
+        assert_eq!(options.tls.jls_username, "jls-user");
+        assert_eq!(options.tls.jls_password, "jls-password");
+    }
+
+    #[tokio::test]
+    async fn anytls_jls_tls_handshake_authenticates() {
+        let server_tls = ServerTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            enable_jls: true,
+            jls_username: "jls-user".to_owned(),
+            jls_password: "jls-password".to_owned(),
+            ..ServerTlsOptions::default()
+        };
+        let certificate = generate_jls_certificate().unwrap();
+        let server_config = build_server_config(&certificate, &server_tls).unwrap();
+        let client_tls = ClientTlsOptions {
+            insecure: true,
+            server_name: "localhost".to_owned(),
+            enable_jls: true,
+            jls_username: "jls-user".to_owned(),
+            jls_password: "jls-password".to_owned(),
+            ..ClientTlsOptions::default()
+        };
+        let client_config = build_client_config(&client_tls).await.unwrap();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            TlsAcceptor::from(Arc::new(server_config))
+                .accept(server_io)
+                .await
+                .unwrap()
+        });
+        let server_name = ServerName::try_from("localhost".to_owned()).unwrap();
+        let client = TlsConnector::from(Arc::new(client_config))
+            .connect(server_name, client_io)
+            .await
+            .unwrap();
+        let server = server.await.unwrap();
+        assert!(matches!(
+            client.get_ref().1.jls_state(),
+            rustls::jls::JlsState::AuthSuccess(_)
+        ));
+        assert!(matches!(
+            server.get_ref().1.jls_state(),
+            rustls::jls::JlsState::AuthSuccess(_)
+        ));
     }
 
     #[test]

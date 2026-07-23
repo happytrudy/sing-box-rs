@@ -1,0 +1,27 @@
+{
+  "outbounds": [
+    {
+      "type": "sunnyquic",
+      "tag": "sunnyquic-out",
+      "server": "sunny.example.com",
+      "server_port": 1443,
+      "username": "demo",
+      "password": "replace-with-a-long-password",
+      "over_stream": false,
+      "congestion_control": {
+        "type": "bbr"
+      },
+      "zero_rtt": true,
+      "tls": {
+        "server_name": "sunny.example.com"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "sunnyquic-out"
+  }
+}

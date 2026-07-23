@@ -1,0 +1,50 @@
+{
+  "certificate_providers": [
+    {
+      "type": "acme",
+      "tag": "sunny-certificate",
+      "domain": "sunny.example.com",
+      "email": "admin@example.com",
+      "data_directory": "acme",
+      "dns01_challenge": {
+        "provider": "cloudflare",
+        "api_token": "${CLOUDFLARE_API_TOKEN}"
+      }
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "sunnyquic",
+      "tag": "sunnyquic-in",
+      "listen": "::",
+      "listen_port": 1443,
+      "users": [
+        {
+          "name": "demo",
+          "password": "replace-with-a-long-password"
+        }
+      ],
+      "congestion_control": {
+        "type": "brutal",
+        "bandwidth_mbps": 100,
+        "disable_loss_compensation": false
+      },
+      "zero_rtt": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "sunny.example.com",
+        "alpn": ["h3"],
+        "certificate_provider": "sunny-certificate"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

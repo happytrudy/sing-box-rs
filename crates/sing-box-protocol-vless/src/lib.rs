@@ -2,7 +2,9 @@ use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::{Arc, RwLock},
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::{Context, Result};
@@ -14,9 +16,9 @@ use sing_box_core::{
 };
 use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc},
+    sync::Mutex,
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -25,7 +27,6 @@ const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
 const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024;
-const BRIDGE_CAPACITY: usize = 1024 * 1024;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Clone, Debug, Deserialize)]
@@ -273,6 +274,7 @@ async fn handle_connection(
     users: Arc<HashMap<[u8; 16], String>>,
     reality: Option<Arc<RealityAcceptor>>,
 ) -> Result<()> {
+    configure_tcp_stream(&stream)?;
     if let Some(reality) = reality {
         let Some(stream) = reality.accept(stream).await? else {
             return Ok(());
@@ -298,6 +300,10 @@ async fn handle_connection(
         users,
     )
     .await
+}
+
+fn configure_tcp_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)
 }
 
 async fn handle_connection_inner<S>(
@@ -341,35 +347,13 @@ where
             .as_bytes(),
         )
         .await?;
+    stream.flush().await?;
 
-    let (tcp_reader, tcp_writer) = tokio::io::split(stream);
-    let (application, bridge) = tokio::io::duplex(BRIDGE_CAPACITY);
-    let (bridge_reader, bridge_writer) = tokio::io::split(bridge);
-    let (control_sender, control_receiver) = mpsc::unbounded_channel();
-    let reader_task = tokio::spawn(websocket_reader(
-        tcp_reader,
-        request.tail,
-        early_data,
-        bridge_writer,
-        control_sender,
-    ));
-    let writer_task = tokio::spawn(websocket_writer(
-        tcp_writer,
-        bridge_reader,
-        control_receiver,
-    ));
-
-    let mut application = application;
-    let result = async {
-        let (destination, user) = read_vless_request(&mut application, &users).await?;
-        application.write_all(&[VLESS_VERSION, 0]).await?;
-        let session = Session::inbound(Network::Tcp, source, destination, tag, "vless", Some(user));
-        router.route(session, Box::new(application)).await
-    }
-    .await;
-    reader_task.abort();
-    writer_task.abort();
-    result
+    let mut application = WebSocketStream::new(stream, request.tail, early_data);
+    let (destination, user) = read_vless_request(&mut application, &users).await?;
+    application.write_all(&[VLESS_VERSION, 0]).await?;
+    let session = Session::inbound(Network::Tcp, source, destination, tag, "vless", Some(user));
+    router.route(session, Box::new(application)).await
 }
 
 struct HttpRequest {
@@ -460,162 +444,402 @@ where
         .await
 }
 
-enum ControlFrame {
-    Pong(Vec<u8>),
-    Close,
+struct WebSocketReadFrame {
+    opcode: u8,
+    remaining: u64,
+    mask: [u8; 4],
+    mask_offset: usize,
+    control_payload: Option<Vec<u8>>,
 }
 
-async fn websocket_reader<R>(
-    mut reader: R,
-    mut prefix: Vec<u8>,
+struct WebSocketStream<S> {
+    inner: S,
+    input: Vec<u8>,
+    input_offset: usize,
     early_data: Vec<u8>,
-    mut destination: tokio::io::WriteHalf<tokio::io::DuplexStream>,
-    controls: mpsc::UnboundedSender<ControlFrame>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut offset = 0;
-    if !early_data.is_empty() {
-        destination.write_all(&early_data).await?;
+    early_offset: usize,
+    read_frame: Option<WebSocketReadFrame>,
+    fragmented: bool,
+    read_closed: bool,
+    write_buffer: Vec<u8>,
+    write_offset: usize,
+    pending_payload_len: Option<usize>,
+    control_write_pending: bool,
+    close_queued: bool,
+}
+
+impl<S> WebSocketStream<S> {
+    fn new(inner: S, input: Vec<u8>, early_data: Vec<u8>) -> Self {
+        Self {
+            inner,
+            input,
+            input_offset: 0,
+            early_data,
+            early_offset: 0,
+            read_frame: None,
+            fragmented: false,
+            read_closed: false,
+            write_buffer: Vec::with_capacity(32 * 1024 + 10),
+            write_offset: 0,
+            pending_payload_len: None,
+            control_write_pending: false,
+            close_queued: false,
+        }
     }
-    let mut fragmented = false;
-    loop {
-        let mut header = [0u8; 2];
-        read_prefixed(&mut reader, &mut prefix, &mut offset, &mut header).await?;
-        let fin = header[0] & 0x80 != 0;
-        anyhow::ensure!(header[0] & 0x70 == 0, "WebSocket reserved bits are set");
-        let opcode = header[0] & 0x0f;
-        let masked = header[1] & 0x80 != 0;
-        anyhow::ensure!(masked, "client WebSocket frame is not masked");
-        let mut payload_len = u64::from(header[1] & 0x7f);
-        if payload_len == 126 {
-            let mut bytes = [0u8; 2];
-            read_prefixed(&mut reader, &mut prefix, &mut offset, &mut bytes).await?;
-            payload_len = u64::from(u16::from_be_bytes(bytes));
-        } else if payload_len == 127 {
-            let mut bytes = [0u8; 8];
-            read_prefixed(&mut reader, &mut prefix, &mut offset, &mut bytes).await?;
-            payload_len = u64::from_be_bytes(bytes);
+
+    fn available_input(&self) -> &[u8] {
+        &self.input[self.input_offset..]
+    }
+
+    fn compact_input(&mut self) {
+        if self.input_offset == self.input.len() {
+            self.input.clear();
+            self.input_offset = 0;
+        } else if self.input_offset >= 32 * 1024 {
+            self.input.drain(..self.input_offset);
+            self.input_offset = 0;
         }
-        anyhow::ensure!(
-            payload_len <= MAX_WS_FRAME_SIZE,
-            "WebSocket frame is too large"
-        );
-        if opcode & 0x08 != 0 {
-            anyhow::ensure!(fin && payload_len <= 125, "invalid WebSocket control frame");
+    }
+
+    fn start_frame(&mut self) -> io::Result<bool> {
+        let input = self.available_input();
+        if input.len() < 2 {
+            return Ok(false);
         }
-        let mut mask = [0u8; 4];
-        read_prefixed(&mut reader, &mut prefix, &mut offset, &mut mask).await?;
-        let mut payload = vec![0u8; payload_len as usize];
-        read_prefixed(&mut reader, &mut prefix, &mut offset, &mut payload).await?;
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
+        let fin = input[0] & 0x80 != 0;
+        if input[0] & 0x70 != 0 {
+            return Err(invalid_websocket_data("WebSocket reserved bits are set"));
         }
+        let opcode = input[0] & 0x0f;
+        if input[1] & 0x80 == 0 {
+            return Err(invalid_websocket_data(
+                "client WebSocket frame is not masked",
+            ));
+        }
+        let length_tag = input[1] & 0x7f;
+        let extended_length = match length_tag {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        let header_length = 2 + extended_length + 4;
+        if input.len() < header_length {
+            return Ok(false);
+        }
+        let payload_length = match length_tag {
+            126 => u64::from(u16::from_be_bytes([input[2], input[3]])),
+            127 => u64::from_be_bytes(input[2..10].try_into().expect("WebSocket length")),
+            value => u64::from(value),
+        };
+        if payload_length > MAX_WS_FRAME_SIZE {
+            return Err(invalid_websocket_data("WebSocket frame is too large"));
+        }
+        let is_control = opcode & 0x08 != 0;
+        if is_control && (!fin || payload_length > 125) {
+            return Err(invalid_websocket_data("invalid WebSocket control frame"));
+        }
+        let mask_offset = 2 + extended_length;
+        let mask = input[mask_offset..mask_offset + 4]
+            .try_into()
+            .expect("WebSocket mask");
         match opcode {
             0x0 => {
-                anyhow::ensure!(fragmented, "unexpected WebSocket continuation frame");
-                destination.write_all(&payload).await?;
-                fragmented = !fin;
+                if !self.fragmented {
+                    return Err(invalid_websocket_data(
+                        "unexpected WebSocket continuation frame",
+                    ));
+                }
+                self.fragmented = !fin;
             }
             0x2 => {
-                anyhow::ensure!(!fragmented, "nested WebSocket fragmented frame");
-                destination.write_all(&payload).await?;
-                fragmented = !fin;
+                if self.fragmented {
+                    return Err(invalid_websocket_data("nested WebSocket fragmented frame"));
+                }
+                self.fragmented = !fin;
             }
+            0x8..=0xA => {}
+            _ => {
+                return Err(invalid_websocket_data(format!(
+                    "unsupported WebSocket opcode: {opcode}"
+                )));
+            }
+        }
+        self.input_offset += header_length;
+        self.read_frame = Some(WebSocketReadFrame {
+            opcode,
+            remaining: payload_length,
+            mask,
+            mask_offset: 0,
+            control_payload: is_control.then(|| Vec::with_capacity(payload_length as usize)),
+        });
+        Ok(true)
+    }
+
+    fn append_frame(&mut self, opcode: u8, payload: &[u8]) {
+        if self.write_offset == self.write_buffer.len() {
+            self.write_buffer.clear();
+            self.write_offset = 0;
+        }
+        self.write_buffer.push(0x80 | opcode);
+        match payload.len() {
+            0..=125 => self.write_buffer.push(payload.len() as u8),
+            126..=65_535 => {
+                self.write_buffer.push(126);
+                self.write_buffer
+                    .extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            length => {
+                self.write_buffer.push(127);
+                self.write_buffer
+                    .extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        self.write_buffer.extend_from_slice(payload);
+    }
+
+    fn finish_read_frame(&mut self) {
+        let frame = self.read_frame.take().expect("WebSocket read frame");
+        match frame.opcode {
             0x8 => {
-                let _ = controls.send(ControlFrame::Close);
-                destination.shutdown().await?;
-                return Ok(());
+                self.append_frame(0x8, frame.control_payload.as_deref().unwrap_or_default());
+                self.control_write_pending = true;
+                self.close_queued = true;
+                self.read_closed = true;
             }
             0x9 => {
-                let _ = controls.send(ControlFrame::Pong(payload));
+                self.append_frame(0xA, frame.control_payload.as_deref().unwrap_or_default());
+                self.control_write_pending = true;
             }
-            0xA => {}
-            _ => anyhow::bail!("unsupported WebSocket opcode: {opcode}"),
+            _ => {}
         }
     }
 }
 
-async fn websocket_writer<W>(
-    mut writer: W,
-    mut source: tokio::io::ReadHalf<tokio::io::DuplexStream>,
-    mut controls: mpsc::UnboundedReceiver<ControlFrame>,
-) -> Result<()>
+impl<S> WebSocketStream<S>
 where
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 32 * 1024];
-    loop {
-        tokio::select! {
-            command = controls.recv() => match command {
-                Some(ControlFrame::Pong(payload)) => write_frame(&mut writer, 0xA, &payload).await?,
-                Some(ControlFrame::Close) | None => {
-                    if command.is_some() {
-                        write_frame(&mut writer, 0x8, &[]).await?;
+    fn poll_fill_input(&mut self, context: &mut TaskContext<'_>) -> Poll<io::Result<bool>> {
+        self.compact_input();
+        let mut chunk = [0u8; 32 * 1024];
+        let mut buffer = ReadBuf::new(&mut chunk);
+        match Pin::new(&mut self.inner).poll_read(context, &mut buffer) {
+            Poll::Ready(Ok(())) => {
+                if buffer.filled().is_empty() {
+                    Poll::Ready(Ok(false))
+                } else {
+                    self.input.extend_from_slice(buffer.filled());
+                    Poll::Ready(Ok(true))
+                }
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush_output(&mut self, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        while self.write_offset < self.write_buffer.len() {
+            match Pin::new(&mut self.inner)
+                .poll_write(context, &self.write_buffer[self.write_offset..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write WebSocket frame",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => self.write_offset += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.write_buffer.clear();
+        self.write_offset = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S> AsyncRead for WebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.early_offset < this.early_data.len() {
+            let count = (this.early_data.len() - this.early_offset).min(output.remaining());
+            output.put_slice(&this.early_data[this.early_offset..this.early_offset + count]);
+            this.early_offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if this.control_write_pending {
+                match this.poll_flush_output(context) {
+                    Poll::Ready(Ok(())) => this.control_write_pending = false,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            if this.read_closed || output.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if this.read_frame.is_none() && !this.start_frame()? {
+                match this.poll_fill_input(context) {
+                    Poll::Ready(Ok(true)) => continue,
+                    Poll::Ready(Ok(false)) if this.available_input().is_empty() => {
+                        this.read_closed = true;
+                        return Poll::Ready(Ok(()));
                     }
-                    return Ok(());
+                    Poll::Ready(Ok(false)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated WebSocket frame header",
+                        )));
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
                 }
-            },
-            read = source.read(&mut buffer) => {
-                let read = read?;
-                if read == 0 {
-                    let _ = write_frame(&mut writer, 0x8, &[]).await;
-                    return Ok(());
+            }
+            if this
+                .read_frame
+                .as_ref()
+                .is_some_and(|frame| frame.remaining == 0)
+            {
+                this.finish_read_frame();
+                continue;
+            }
+            if this.available_input().is_empty() {
+                match this.poll_fill_input(context) {
+                    Poll::Ready(Ok(true)) => {}
+                    Poll::Ready(Ok(false)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated WebSocket frame payload",
+                        )));
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
                 }
-                write_frame(&mut writer, 0x2, &buffer[..read]).await?;
+            }
+            let frame = this.read_frame.as_ref().expect("WebSocket read frame");
+            let is_control = frame.control_payload.is_some();
+            let count = (frame.remaining as usize)
+                .min(this.available_input().len())
+                .min(if is_control {
+                    usize::MAX
+                } else {
+                    output.remaining()
+                });
+            let mask = frame.mask;
+            let mask_offset = frame.mask_offset;
+            if is_control {
+                let decoded = this.available_input()[..count]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[(mask_offset + index) % 4])
+                    .collect::<Vec<_>>();
+                this.read_frame
+                    .as_mut()
+                    .expect("WebSocket read frame")
+                    .control_payload
+                    .as_mut()
+                    .expect("WebSocket control payload")
+                    .extend_from_slice(&decoded);
+            } else {
+                let destination = output.initialize_unfilled_to(count);
+                for (index, byte) in this.available_input()[..count].iter().enumerate() {
+                    destination[index] = byte ^ mask[(mask_offset + index) % 4];
+                }
+                output.advance(count);
+            }
+            this.input_offset += count;
+            let frame = this.read_frame.as_mut().expect("WebSocket read frame");
+            frame.remaining -= count as u64;
+            frame.mask_offset = (frame.mask_offset + count) % 4;
+            this.compact_input();
+            if !is_control {
+                return Poll::Ready(Ok(()));
             }
         }
     }
 }
 
-async fn write_frame<W>(writer: &mut W, opcode: u8, payload: &[u8]) -> io::Result<()>
+impl<S> AsyncWrite for WebSocketStream<S>
 where
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut header = Vec::with_capacity(10);
-    header.push(0x80 | opcode);
-    match payload.len() {
-        0..=125 => header.push(payload.len() as u8),
-        126..=65_535 => {
-            header.push(126);
-            header.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-        length => {
-            header.push(127);
-            header.extend_from_slice(&(length as u64).to_be_bytes());
+        if let Some(accepted) = this.pending_payload_len {
+            return match this.poll_flush_output(context) {
+                Poll::Ready(Ok(())) => {
+                    this.pending_payload_len = None;
+                    Poll::Ready(Ok(accepted))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        match this.poll_flush_output(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        let accepted = data.len().min(MAX_WS_FRAME_SIZE as usize);
+        this.append_frame(0x2, &data[..accepted]);
+        this.pending_payload_len = Some(accepted);
+        match this.poll_flush_output(context) {
+            Poll::Ready(Ok(())) => {
+                this.pending_payload_len = None;
+                Poll::Ready(Ok(accepted))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
         }
     }
-    writer.write_all(&header).await?;
-    writer.write_all(payload).await
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_flush_output(context) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(context),
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.close_queued {
+            this.append_frame(0x8, &[]);
+            this.close_queued = true;
+        }
+        match this.poll_flush_output(context) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(context),
+            result => result,
+        }
+    }
 }
 
-async fn read_prefixed<R>(
-    reader: &mut R,
-    prefix: &mut [u8],
-    offset: &mut usize,
-    output: &mut [u8],
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut written = 0;
-    if *offset < prefix.len() {
-        let available = (prefix.len() - *offset).min(output.len());
-        output[..available].copy_from_slice(&prefix[*offset..*offset + available]);
-        *offset += available;
-        written = available;
-    }
-    if written < output.len() {
-        reader.read_exact(&mut output[written..]).await?;
-    }
-    Ok(())
+fn invalid_websocket_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-async fn read_vless_request(
-    stream: &mut tokio::io::DuplexStream,
+async fn read_vless_request<S>(
+    stream: &mut S,
     users: &HashMap<[u8; 16], String>,
-) -> Result<(Address, String)> {
+) -> Result<(Address, String)>
+where
+    S: AsyncRead + Unpin,
+{
     let mut version = [0u8; 1];
     stream.read_exact(&mut version).await?;
     anyhow::ensure!(version[0] == VLESS_VERSION, "unsupported VLESS version");
@@ -819,7 +1043,261 @@ fn sha1(message: &[u8]) -> [u8; 20] {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use super::*;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        data: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct PartialWriter {
+        polls: usize,
+        data: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            self.data.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for CountingWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls += 1;
+            if self.polls == 2 {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let written = data.len().min(2);
+            self.data.extend_from_slice(&data[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for PartialWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn masked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = vec![
+            (if fin { 0x80 } else { 0 }) | opcode,
+            0x80 | payload.len() as u8,
+        ];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+        frame
+    }
+
+    async fn read_server_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0] & 0x0f, 0x2);
+        assert_eq!(header[1] & 0x80, 0);
+        let length = match header[1] & 0x7f {
+            126 => {
+                let mut bytes = [0u8; 2];
+                stream.read_exact(&mut bytes).await.unwrap();
+                u16::from_be_bytes(bytes) as usize
+            }
+            127 => {
+                let mut bytes = [0u8; 8];
+                stream.read_exact(&mut bytes).await.unwrap();
+                u64::from_be_bytes(bytes) as usize
+            }
+            length => length as usize,
+        };
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).await.unwrap();
+        payload
+    }
+
+    #[tokio::test]
+    async fn configures_inbound_tcp_for_low_latency() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(TcpStream::connect(address));
+        let (server, _) = listener.accept().await.unwrap();
+        configure_tcp_stream(&server).unwrap();
+        assert!(server.nodelay().unwrap());
+        client.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writes_websocket_header_and_payload_together() {
+        let writer = CountingWriter::default();
+        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new());
+
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+
+        assert_eq!(stream.inner.writes, 1);
+        assert_eq!(stream.inner.data, [0x82, 4, b'p', b'i', b'n', b'g']);
+    }
+
+    #[tokio::test]
+    async fn preserves_a_frame_across_partial_socket_writes() {
+        let writer = PartialWriter::default();
+        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new());
+
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+
+        assert_eq!(stream.inner.data, [0x82, 4, b'p', b'i', b'n', b'g']);
+    }
+
+    #[tokio::test]
+    async fn reads_masked_websocket_payload_without_a_bridge() {
+        let (mut client, server) = tokio::io::duplex(128);
+        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new());
+        let frame = masked_frame(0x2, true, b"ping");
+        client.write_all(&frame).await.unwrap();
+
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+
+        assert_eq!(&payload, b"ping");
+    }
+
+    #[tokio::test]
+    async fn handles_fragmented_data_and_ping_without_background_tasks() {
+        let (mut client, server) = tokio::io::duplex(256);
+        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new());
+        let mut frames = masked_frame(0x2, false, b"pi");
+        frames.extend_from_slice(&masked_frame(0x9, true, b"ok"));
+        frames.extend_from_slice(&masked_frame(0x0, true, b"ng"));
+        client.write_all(&frames).await.unwrap();
+
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        let mut pong = [0u8; 4];
+        client.read_exact(&mut pong).await.unwrap();
+
+        assert_eq!(&payload, b"ping");
+        assert_eq!(pong, [0x8A, 2, b'o', b'k']);
+    }
+
+    #[tokio::test]
+    async fn routes_vless_websocket_tcp_without_a_duplex_bridge() {
+        use sing_box_core::{Config, Engine, Registry, register_builtins};
+
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            let (mut reader, mut writer) = stream.split();
+            tokio::io::copy(&mut reader, &mut writer).await.unwrap();
+        });
+        let mut registry = Registry::new();
+        register_builtins(&mut registry).unwrap();
+        register(&mut registry).unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "inbounds": [{
+                "type": "vless",
+                "tag": "vless-in",
+                "listen": "127.0.0.1",
+                "listen_port": 0,
+                "users": [{"uuid": "d4f2ad1c-f6db-481e-91de-9d551f8885c9"}],
+                "transport": {"type": "ws", "path": "/proxy"}
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+        }))
+        .unwrap();
+        let engine = Engine::new(config, registry).await.unwrap();
+        engine.start().await.unwrap();
+        let inbound_address = engine.inbound_addr("vless-in").await.unwrap();
+        let mut client = TcpStream::connect(inbound_address).await.unwrap();
+        client
+            .write_all(
+                b"GET /proxy HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(client.read_u8().await.unwrap());
+        }
+        assert!(response.starts_with(b"HTTP/1.1 101"));
+
+        let uuid = parse_uuid("d4f2ad1c-f6db-481e-91de-9d551f8885c9").unwrap();
+        let mut request = vec![VLESS_VERSION];
+        request.extend_from_slice(&uuid);
+        request.extend_from_slice(&[0, VLESS_COMMAND_TCP]);
+        request.extend_from_slice(&echo_address.port().to_be_bytes());
+        request.extend_from_slice(&[1, 127, 0, 0, 1]);
+        request.extend_from_slice(b"ping");
+        client
+            .write_all(&masked_frame(0x2, true, &request))
+            .await
+            .unwrap();
+
+        let mut application_data = Vec::new();
+        while application_data.len() < 6 {
+            application_data.extend_from_slice(&read_server_frame(&mut client).await);
+        }
+        assert_eq!(&application_data[..2], &[VLESS_VERSION, 0]);
+        assert_eq!(&application_data[2..], b"ping");
+
+        client.shutdown().await.unwrap();
+        drop(client);
+        engine.shutdown().await.unwrap();
+        echo_task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn parses_official_version_zero_request() {

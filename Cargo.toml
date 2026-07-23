@@ -8,6 +8,7 @@ members = [
     "crates/sing-box-protocol-vless",
     "crates/sing-box-protocol-anytls",
     "crates/sing-box-protocol-shadowquic",
+    "crates/sing-box-protocol-sunnyquic",
     "crates/sing-box-tls",
     "crates/sing-box-cli",
 ]
