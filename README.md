@@ -22,19 +22,34 @@ feature replacement for sing-box.
 - ACME certificate provider with Cloudflare DNS-01, persistent cache, and renewal
 - external UDP DNS resolver with IPv4/IPv6 strategies and TTL cache
 - configurable logging, NTP offset measurement, direct and block outbounds
-- TCP/UDP `direct` outbound with IPv4 and IPv6 sockets
-- SOCKS5 CONNECT and UDP ASSOCIATE inbound
-- external Snell inbound/outbound adapter
-- Snell v4/v5 legacy and v6 default/unshaped/unsafe-raw modes
-- Snell authenticated TCP, UDP, connection reuse, replay protection, and obfs
-- external Hysteria2 inbound/outbound adapter backed by `sing-quic-rs`
-- AnyTLS TLS inbound/outbound adapter with password authentication and TCP session multiplexing
-- VLESS WebSocket TCP inbound with UUID authentication and early data
-- Cloudflared remote-managed HTTP/2 inbound with Cap'n Proto registration
-- Hysteria2 HTTP/3 authentication and multiplexed TCP streams over QUIC
-- Hysteria2 BBR default and negotiated Brutal congestion control
-- PEM and DER certificate loading for Hysteria2
 - executable client and server configurations
+
+## Proxy transport combinations
+
+The matrix lists implemented protocol, carrier, camouflage/TLS, and congestion
+control combinations. `Inbound` and `Outbound` describe the current adapter,
+not the upstream protocol's theoretical capabilities.
+
+| Transport combination | Inbound | Outbound | Networks and capabilities | Examples |
+| --- | --- | --- | --- | --- |
+| Snell v4/v5 + legacy transport | Yes | Yes | TCP and UDP; authenticated sessions, reuse, replay protection, and obfs | `server.json`, `client.json` |
+| Snell v6 + default/unshaped/unsafe-raw | Yes | Yes | TCP and UDP; v6 shaping modes and connection reuse | `server.json`, `client.json` |
+| Hysteria2 + QUIC TLS + BBR | Yes | Yes | Inbound TCP/UDP; outbound TCP; selected when both bandwidth values are zero | `hysteria2-server.json`, `hysteria2-client.json` with `up_mbps` and `down_mbps` set to `0` |
+| Hysteria2 + QUIC TLS + Brutal | Yes | Yes | Inbound TCP/UDP; outbound TCP; negotiated bandwidth and optional loss compensation | `hysteria2-server.json`, `hysteria2-client.json` |
+| ShadowQUIC + JLS + BBR | Yes | Yes | Inbound TCP/UDP; outbound TCP; JLS authentication, 0-RTT, and optional upstream fallback | `shadowquic-server.json`, `shadowquic-client.json` with `congestion_control.type` set to `bbr` |
+| ShadowQUIC + JLS + Brutal | Yes | Yes | Inbound TCP/UDP; outbound TCP; rate pacing and optional loss compensation | `shadowquic-server.json`, `shadowquic-client.json` |
+| SunnyQUIC + native QUIC TLS + BBR | Yes | Yes | TCP and UDP; UDP datagrams or streams; static certificate or `certificate_provider` | `sunnyquic-server-bbr.json`, `sunnyquic-client-bbr.json` |
+| SunnyQUIC + native QUIC TLS + Brutal | Yes | Yes | TCP and UDP; rate pacing and optional loss compensation | `sunnyquic-server-brutal.json`, `sunnyquic-client-brutal.json` |
+| Cloudflared + HTTP/2 | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and Cap'n Proto RPC | `cloudflared-inbound.json` with `protocol` set to `http2` |
+| Cloudflared + QUIC | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and datagram v2/v3 | `cloudflared-inbound.json` |
+| VLESS + WebSocket | Yes | No | TCP; UUID authentication, path validation, masking, and early data | `vless-ws-server.json` |
+| VLESS + WebSocket + Reality | Yes | No | TCP; Reality server authentication and invalid-client fallback | `vless-reality-ws-server.json` |
+| AnyTLS + standard TLS | Yes | Yes | TCP and UDP-over-TCP; v2 multiplexing, padding, static certificate, or `certificate_provider` | `anytls-server.json`, `anytls-client.json` |
+| AnyTLS + Reality | Yes | No | TCP and UDP-over-TCP; Reality replaces the inbound TLS acceptor | `anytls-reality-server.json` |
+| AnyTLS + JLS | Yes | Yes | TCP and UDP-over-TCP; JLS handshake followed by normal AnyTLS authentication and multiplexing | `anytls-jls-server.json`, `anytls-jls-client.json` |
+
+Core endpoints outside this transport matrix are the SOCKS5 TCP/UDP inbound and
+the Direct and Block TCP/UDP outbounds.
 
 ## Project layout
 
@@ -412,11 +427,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The `Manual Release` workflow under GitHub Actions publishes Linux AMD64 and
 ARM64 archives. It reads the release version from `[workspace.package]` in the
-root `Cargo.toml`; for example, version `0.1.0` produces release tag `v0.1.0`.
+root `Cargo.toml`; for example, version `0.1.3` produces release tag `v0.1.3`.
 
-Before running it, push matching `master` revisions of `sing-quic-rs`,
-`sing-snell-rs`, and `sing-dns-rs` to the `happytrudy` GitHub account. Open
-**Actions**, select **Manual Release**, choose **Run workflow**, and optionally
-enable draft or prerelease mode. Re-running the workflow for the same commit
+Before running it, change that version to a new value and push the required
+`sing-quic-rs`, `sing-snell-rs`, `sing-dns-rs`, `quinn`, and `rustls` revisions
+to the `happytrudy` GitHub account. Open **Actions**, select **Manual Release**,
+choose **Run workflow**, and optionally enable draft or prerelease mode. The
+workflow pins each dependency's current `master` commit so verification and all
+release builds use the same source. Re-running the workflow for the same commit
 replaces the existing release assets; using the same version for a different
 commit is rejected.

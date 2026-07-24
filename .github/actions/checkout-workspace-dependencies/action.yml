@@ -2,50 +2,61 @@ name: Checkout workspace dependencies
 description: Checkout sing-box-rs path dependencies from happytrudy repositories
 
 inputs:
-  ref:
-    description: Git ref shared by the dependency repositories
-    required: false
-    default: master
+  sing_quic_ref:
+    description: Commit or ref for happytrudy/sing-quic-rs
+    required: true
+  sing_snell_ref:
+    description: Commit or ref for happytrudy/sing-snell-rs
+    required: true
+  sing_dns_ref:
+    description: Commit or ref for happytrudy/sing-dns-rs
+    required: true
+  quinn_ref:
+    description: Commit or ref for happytrudy/quinn
+    required: true
+  rustls_ref:
+    description: Commit or ref for happytrudy/rustls
+    required: true
 
 runs:
   using: composite
   steps:
     - name: Checkout happytrudy/sing-quic-rs
-      uses: actions/checkout@v7
+      uses: actions/checkout@v6
       with:
         repository: happytrudy/sing-quic-rs
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.sing_quic_ref }}
         path: sing-quic-rs
         persist-credentials: false
 
     - name: Checkout happytrudy/sing-snell-rs
-      uses: actions/checkout@v7
+      uses: actions/checkout@v6
       with:
         repository: happytrudy/sing-snell-rs
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.sing_snell_ref }}
         path: sing-snell-rs
         persist-credentials: false
 
     - name: Checkout happytrudy/sing-dns-rs
-      uses: actions/checkout@v7
+      uses: actions/checkout@v6
       with:
         repository: happytrudy/sing-dns-rs
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.sing_dns_ref }}
         path: sing-dns-rs
         persist-credentials: false
 
     - name: Checkout happytrudy/quinn
-      uses: actions/checkout@v7
+      uses: actions/checkout@v6
       with:
         repository: happytrudy/quinn
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.quinn_ref }}
         path: quinn
         persist-credentials: false
 
     - name: Checkout happytrudy/rustls
-      uses: actions/checkout@v7
+      uses: actions/checkout@v6
       with:
         repository: happytrudy/rustls
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.rustls_ref }}
         path: rustls
         persist-credentials: false

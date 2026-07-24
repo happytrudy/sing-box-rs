@@ -28,9 +28,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      sing_quic_ref: ${{ steps.dependencies.outputs.sing_quic_ref }}
+      sing_snell_ref: ${{ steps.dependencies.outputs.sing_snell_ref }}
+      sing_dns_ref: ${{ steps.dependencies.outputs.sing_dns_ref }}
+      quinn_ref: ${{ steps.dependencies.outputs.quinn_ref }}
+      rustls_ref: ${{ steps.dependencies.outputs.rustls_ref }}
     steps:
       - name: Checkout sing-box-rs
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           path: sing-box-rs
@@ -62,7 +67,7 @@ jobs:
           if git -C sing-box-rs rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
             tagged_commit="$(git -C sing-box-rs rev-list -n 1 "$tag")"
             if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
-              echo "$tag already points to $tagged_commit; bump Cargo.toml before releasing $GITHUB_SHA" >&2
+              echo "$tag already points to $tagged_commit. Change [workspace.package].version in Cargo.toml before releasing $GITHUB_SHA." >&2
               exit 1
             fi
           fi
@@ -75,21 +80,53 @@ jobs:
             echo "- Commit: \`$GITHUB_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Pin workspace dependency commits
+        id: dependencies
+        shell: bash
+        run: |
+          resolve_master() {
+            local repository="$1"
+            local output_name="$2"
+            local sha
+            sha="$(git ls-remote "https://github.com/happytrudy/$repository.git" refs/heads/master | awk '{print $1}')"
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Failed to resolve happytrudy/$repository master" >&2
+              exit 1
+            fi
+            echo "$output_name=$sha" >> "$GITHUB_OUTPUT"
+            echo "- happytrudy/$repository: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          {
+            echo "### Pinned workspace dependencies"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          resolve_master sing-quic-rs sing_quic_ref
+          resolve_master sing-snell-rs sing_snell_ref
+          resolve_master sing-dns-rs sing_dns_ref
+          resolve_master quinn quinn_ref
+          resolve_master rustls rustls_ref
+
   verify:
     name: Test release source
     needs: metadata
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout sing-box-rs
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           path: sing-box-rs
           persist-credentials: false
 
       - name: Checkout workspace dependencies
         uses: ./sing-box-rs/.github/actions/checkout-workspace-dependencies
         with:
-          ref: master
+          sing_quic_ref: ${{ needs.metadata.outputs.sing_quic_ref }}
+          sing_snell_ref: ${{ needs.metadata.outputs.sing_snell_ref }}
+          sing_dns_ref: ${{ needs.metadata.outputs.sing_dns_ref }}
+          quinn_ref: ${{ needs.metadata.outputs.quinn_ref }}
+          rustls_ref: ${{ needs.metadata.outputs.rustls_ref }}
 
       - name: Install stable Rust
         shell: bash
@@ -114,24 +151,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux-amd64
-          - runner: ubuntu-22.04-arm
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout sing-box-rs
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           path: sing-box-rs
           persist-credentials: false
 
       - name: Checkout workspace dependencies
         uses: ./sing-box-rs/.github/actions/checkout-workspace-dependencies
         with:
-          ref: master
+          sing_quic_ref: ${{ needs.metadata.outputs.sing_quic_ref }}
+          sing_snell_ref: ${{ needs.metadata.outputs.sing_snell_ref }}
+          sing_dns_ref: ${{ needs.metadata.outputs.sing_dns_ref }}
+          quinn_ref: ${{ needs.metadata.outputs.quinn_ref }}
+          rustls_ref: ${{ needs.metadata.outputs.rustls_ref }}
 
       - name: Install stable Rust
         shell: bash
