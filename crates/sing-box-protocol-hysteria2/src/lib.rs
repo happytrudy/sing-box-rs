@@ -39,11 +39,34 @@ struct Hysteria2OutboundOptions {
     disable_loss_compensation: bool,
     #[serde(default)]
     brutal_debug: bool,
+    #[serde(flatten)]
+    quic: QuicOptions,
+    tls: OutboundTlsOptions,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct QuicOptions {
+    #[serde(default)]
+    idle_timeout: String,
+    #[serde(default)]
+    keep_alive_period: String,
+    #[serde(default)]
+    stream_receive_window: Option<MemoryBytes>,
+    #[serde(default)]
+    connection_receive_window: Option<MemoryBytes>,
+    #[serde(default)]
+    max_concurrent_streams: u64,
     #[serde(default)]
     initial_packet_size: u16,
     #[serde(default)]
     disable_path_mtu_discovery: bool,
-    tls: OutboundTlsOptions,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum MemoryBytes {
+    Integer(u64),
+    Text(String),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -107,10 +130,8 @@ struct Hysteria2InboundOptions {
     disable_loss_compensation: bool,
     #[serde(default)]
     brutal_debug: bool,
-    #[serde(default)]
-    initial_packet_size: u16,
-    #[serde(default)]
-    disable_path_mtu_discovery: bool,
+    #[serde(flatten)]
+    quic: QuicOptions,
     #[serde(default)]
     masquerade: Option<masquerade::MasqueradeOptions>,
     tls: InboundTlsOptions,
@@ -341,7 +362,7 @@ async fn run_server(
                                         accepted.destination.host(),
                                         accepted.destination.port(),
                                     )?;
-                                    let session = Session::inbound(
+                                    let mut session = Session::inbound(
                                         Network::Tcp,
                                         accepted.source,
                                         destination,
@@ -349,7 +370,25 @@ async fn run_server(
                                         "hysteria2",
                                         Some(accepted.user),
                                     );
-                                    router.route(session, Box::new(accepted.stream)).await
+                                    let mut stream = accepted.stream;
+                                    match router.connect(&mut session).await {
+                                        Ok(outbound) => {
+                                            stream.handshake_success().await?;
+                                            router.relay(session, Box::new(stream), outbound).await
+                                        }
+                                        Err(error) => {
+                                            let message = error.to_string();
+                                            if let Err(handshake_error) =
+                                                stream.handshake_failure(&message).await
+                                            {
+                                                tracing::debug!(
+                                                    %handshake_error,
+                                                    "failed to report Hysteria2 handshake failure"
+                                                );
+                                            }
+                                            Err(error)
+                                        }
+                                    }
                                 }
                                 Accepted::Packet(accepted) => {
                                     let destination = Address::new(
@@ -468,10 +507,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     disable_loss_compensation: options.disable_loss_compensation,
                     brutal_debug: options.brutal_debug,
                 },
-                QuicTransportOptions {
-                    initial_packet_size: options.initial_packet_size,
-                    disable_path_mtu_discovery: options.disable_path_mtu_discovery,
-                },
+                parse_quic_options(&options.quic)?,
             )?;
             Ok(Arc::new(Hysteria2Outbound {
                 tag,
@@ -537,10 +573,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     disable_loss_compensation: options.disable_loss_compensation,
                     brutal_debug: options.brutal_debug,
                 },
-                transport_options: QuicTransportOptions {
-                    initial_packet_size: options.initial_packet_size,
-                    disable_path_mtu_discovery: options.disable_path_mtu_discovery,
-                },
+                transport_options: parse_quic_options(&options.quic)?,
                 masquerade,
             };
             Ok(Arc::new(Hysteria2Inbound {
@@ -558,6 +591,97 @@ pub fn register(registry: &mut Registry) -> Result<()> {
 fn mbps_to_bps(mbps: u64) -> Result<u64> {
     mbps.checked_mul(125_000)
         .context("Hysteria2 bandwidth is too large")
+}
+
+fn parse_quic_options(options: &QuicOptions) -> Result<QuicTransportOptions> {
+    Ok(QuicTransportOptions {
+        idle_timeout: parse_quic_duration(&options.idle_timeout)?,
+        keep_alive_period: parse_quic_duration(&options.keep_alive_period)?,
+        stream_receive_window: options
+            .stream_receive_window
+            .as_ref()
+            .map(parse_memory_bytes)
+            .transpose()?
+            .unwrap_or_default(),
+        connection_receive_window: options
+            .connection_receive_window
+            .as_ref()
+            .map(parse_memory_bytes)
+            .transpose()?
+            .unwrap_or_default(),
+        max_concurrent_streams: options.max_concurrent_streams,
+        initial_packet_size: options.initial_packet_size,
+        disable_path_mtu_discovery: options.disable_path_mtu_discovery,
+    })
+}
+
+fn parse_quic_duration(value: &str) -> Result<Option<Duration>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let duration = parse_duration(value)?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn parse_memory_bytes(value: &MemoryBytes) -> Result<u64> {
+    let value = match value {
+        MemoryBytes::Integer(value) => return Ok(*value),
+        MemoryBytes::Text(value) => value,
+    };
+    let value = value.trim();
+    let unit_start = value
+        .find(|character: char| !character.is_ascii_digit())
+        .context("memory size unit is missing")?;
+    anyhow::ensure!(unit_start > 0, "invalid memory size: {value}");
+    let number: u64 = value[..unit_start].parse()?;
+    let multiplier = match value[unit_start..].trim().to_ascii_lowercase().as_str() {
+        "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        "t" | "tb" => 1 << 40,
+        "p" | "pb" => 1 << 50,
+        "e" | "eb" => 1 << 60,
+        unit => anyhow::bail!("unsupported memory size unit: {unit}"),
+    };
+    number
+        .checked_mul(multiplier)
+        .context("memory size is too large")
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "duration is empty");
+    let mut total = 0.0f64;
+    let mut position = 0;
+    while position < value.len() {
+        let number_start = position;
+        while position < value.len()
+            && (value.as_bytes()[position].is_ascii_digit() || value.as_bytes()[position] == b'.')
+        {
+            position += 1;
+        }
+        anyhow::ensure!(position > number_start, "invalid duration: {value}");
+        let number: f64 = value[number_start..position].parse()?;
+        let unit_start = position;
+        while position < value.len() && value.as_bytes()[position].is_ascii_alphabetic() {
+            position += 1;
+        }
+        let unit = &value[unit_start..position];
+        let multiplier = match unit {
+            "ns" => 1e-9,
+            "us" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86400.0,
+            _ => anyhow::bail!("invalid duration unit: {unit}"),
+        };
+        total += number * multiplier;
+    }
+    anyhow::ensure!(total >= 0.0, "duration cannot be negative");
+    Ok(Duration::from_secs_f64(total))
 }
 
 fn parse_certificates(data: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -592,14 +716,26 @@ mod tests {
         let inbound: Hysteria2InboundOptions = serde_json::from_value(serde_json::json!({
             "listen": "::",
             "listen_port": 443,
+            "idle_timeout": "45s",
+            "keep_alive_period": "5s",
+            "stream_receive_window": "16MB",
+            "connection_receive_window": 33554432,
+            "max_concurrent_streams": 4096,
             "initial_packet_size": 1200,
             "disable_path_mtu_discovery": true,
             "tls": { "enabled": true },
             "users": [{ "password": "secret" }]
         }))
         .unwrap();
-        assert_eq!(inbound.initial_packet_size, 1200);
-        assert!(inbound.disable_path_mtu_discovery);
+        let inbound_quic = parse_quic_options(&inbound.quic).unwrap();
+        assert_eq!(inbound_quic.idle_timeout, Some(Duration::from_secs(45)));
+        assert_eq!(inbound_quic.keep_alive_period, Some(Duration::from_secs(5)));
+        assert_eq!(inbound_quic.stream_receive_window, 16 << 20);
+        assert_eq!(inbound_quic.connection_receive_window, 32 << 20);
+        assert_eq!(inbound_quic.max_concurrent_streams, 4096);
+        assert_eq!(inbound_quic.initial_packet_size, 1200);
+        assert!(inbound_quic.disable_path_mtu_discovery);
+        assert_eq!(parse_quic_duration("0s").unwrap(), None);
 
         let outbound: Hysteria2OutboundOptions = serde_json::from_value(serde_json::json!({
             "server": "example.com",
@@ -613,7 +749,8 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(outbound.initial_packet_size, 1200);
-        assert!(outbound.disable_path_mtu_discovery);
+        let outbound_quic = parse_quic_options(&outbound.quic).unwrap();
+        assert_eq!(outbound_quic.initial_packet_size, 1200);
+        assert!(outbound_quic.disable_path_mtu_discovery);
     }
 }

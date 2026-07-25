@@ -18,6 +18,11 @@
       "down_mbps": 100,
       "disable_loss_compensation": false,
       "brutal_debug": false,
+      "idle_timeout": "30s",
+      "keep_alive_period": "10s",
+      "stream_receive_window": "8MB",
+      "connection_receive_window": "20MB",
+      "max_concurrent_streams": 4096,
       "initial_packet_size": 1200,
       "disable_path_mtu_discovery": true,
       "tls": {

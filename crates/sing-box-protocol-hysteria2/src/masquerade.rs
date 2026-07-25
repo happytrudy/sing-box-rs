@@ -24,7 +24,7 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
-const MAX_PROXY_RESPONSE_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_MASQUERADE_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 const PROXY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,10 +177,15 @@ impl FixedHandler {
                 );
             }
         }
+        let content = content.into_bytes();
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_MASQUERADE_RESPONSE_SIZE,
+            "masquerade string content exceeds size limit"
+        );
         Ok(Self {
             status,
             headers,
-            content: content.into_bytes(),
+            content,
         })
     }
 
@@ -286,6 +291,12 @@ async fn serve_file(
             return directory_listing(&path, request.uri().path()).await;
         }
     }
+    if tokio::fs::metadata(&path)
+        .await
+        .is_ok_and(|metadata| metadata.len() > MAX_MASQUERADE_RESPONSE_SIZE)
+    {
+        return plain_response(StatusCode::PAYLOAD_TOO_LARGE, Vec::new());
+    }
     let body = match tokio::fs::read(&path).await {
         Ok(body) => body,
         Err(_) => return plain_response(StatusCode::NOT_FOUND, Vec::new()),
@@ -303,8 +314,13 @@ async fn directory_listing(path: &Path, request_path: &str) -> Response<Vec<u8>>
         Err(_) => return plain_response(StatusCode::NOT_FOUND, Vec::new()),
     };
     let mut names = Vec::new();
+    let mut listing_size = 0u64;
     while let Ok(Some(entry)) = entries.next_entry().await {
         if let Ok(name) = entry.file_name().into_string() {
+            listing_size = listing_size.saturating_add(name.len() as u64);
+            if listing_size > MAX_MASQUERADE_RESPONSE_SIZE {
+                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, Vec::new());
+            }
             let is_dir = entry.file_type().await.is_ok_and(|kind| kind.is_dir());
             names.push((name, is_dir));
         }
@@ -328,6 +344,9 @@ async fn directory_listing(path: &Path, request_path: &str) -> Response<Vec<u8>>
         ));
     }
     html.push_str("</pre></body></html>");
+    if html.len() as u64 > MAX_MASQUERADE_RESPONSE_SIZE {
+        return plain_response(StatusCode::PAYLOAD_TOO_LARGE, Vec::new());
+    }
     let mut response = plain_response(StatusCode::OK, html.into_bytes());
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -630,11 +649,11 @@ async fn proxy_request(
 
     let mut response = Vec::new();
     stream
-        .take(MAX_PROXY_RESPONSE_SIZE + 1)
+        .take(MAX_MASQUERADE_RESPONSE_SIZE + 1)
         .read_to_end(&mut response)
         .await?;
     anyhow::ensure!(
-        response.len() as u64 <= MAX_PROXY_RESPONSE_SIZE,
+        response.len() as u64 <= MAX_MASQUERADE_RESPONSE_SIZE,
         "masquerade proxy response exceeds size limit"
     );
     parse_proxy_response(&response, parts.method == Method::HEAD)

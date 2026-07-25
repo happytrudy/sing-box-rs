@@ -298,6 +298,12 @@ server and 100 Mbps server-to-client.
 it to compensate for packet loss, which is useful behind a hard bandwidth
 policer. `brutal_debug` logs RTT, congestion window, MTU, packet loss, and
 measured send/receive Mbps every two seconds for each active QUIC connection.
+The inbound and outbound also accept the sing-box QUIC transport fields
+`idle_timeout`, `keep_alive_period`, `stream_receive_window`,
+`connection_receive_window`, `max_concurrent_streams`, `initial_packet_size`,
+and `disable_path_mtu_discovery`. These map directly to Quinn's public
+`TransportConfig` methods. The default incoming stream limit remains the
+official Hysteria2 value; `max_concurrent_streams` only changes it when set.
 
 AnyTLS uses the sing-box protocol shape: the inbound accepts `users` and TLS
 certificate files or a shared `certificate_provider` tag; the outbound accepts
