@@ -13,3 +13,6 @@ sing-quic.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

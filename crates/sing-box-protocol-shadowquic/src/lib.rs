@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -13,7 +14,8 @@ use sing_box_core::{
 };
 use sing_quic::shadowquic::{
     Accepted, Client, ClientOptions, CongestionConfig as ShadowQuicCongestionConfig, Server,
-    ServerOptions, ShadowQuicPacket, ShadowQuicPacketConnection, User as ShadowQuicUser,
+    ServerOptions, ShadowQuicPacket, ShadowQuicPacketConnection,
+    TransportOptions as ShadowQuicTransportOptions, User as ShadowQuicUser,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -30,10 +32,61 @@ struct ShadowQuicOutboundOptions {
     congestion_control: CongestionControlOptions,
     #[serde(default = "default_zero_rtt")]
     zero_rtt: bool,
+    #[serde(flatten)]
+    quic: ShadowQuicQuicOptions,
 }
 
 fn default_zero_rtt() -> bool {
     true
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShadowQuicQuicOptions {
+    #[serde(default = "default_initial_packet_size")]
+    initial_packet_size: u16,
+    #[serde(default = "default_max_concurrent_streams")]
+    max_concurrent_streams: u64,
+    #[serde(default = "default_connection_receive_window")]
+    connection_receive_window: u64,
+    #[serde(default = "default_stream_receive_window")]
+    stream_receive_window: u64,
+    #[serde(default)]
+    keep_alive_period: String,
+    #[serde(default = "default_idle_timeout")]
+    idle_timeout: String,
+    #[serde(default)]
+    disable_path_mtu_discovery: bool,
+}
+
+impl ShadowQuicQuicOptions {
+    fn into_protocol(self) -> Result<ShadowQuicTransportOptions> {
+        Ok(ShadowQuicTransportOptions {
+            initial_packet_size: self.initial_packet_size,
+            max_concurrent_streams: self.max_concurrent_streams,
+            connection_receive_window: self.connection_receive_window,
+            stream_receive_window: self.stream_receive_window,
+            keep_alive_period: parse_optional_duration(&self.keep_alive_period)?,
+            idle_timeout: parse_optional_duration(&self.idle_timeout)?,
+            disable_path_mtu_discovery: self.disable_path_mtu_discovery,
+        })
+    }
+}
+
+fn default_initial_packet_size() -> u16 {
+    1_300
+}
+fn default_max_concurrent_streams() -> u64 {
+    1_000
+}
+fn default_connection_receive_window() -> u64 {
+    20 * 1024 * 1024
+}
+fn default_stream_receive_window() -> u64 {
+    5_000_000
+}
+fn default_idle_timeout() -> String {
+    "30s".into()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -125,6 +178,8 @@ struct ShadowQuicInboundOptions {
     #[serde(default)]
     congestion_control: CongestionControlOptions,
     users: Vec<UserOptions>,
+    #[serde(flatten)]
+    quic: ShadowQuicQuicOptions,
 }
 
 fn default_listen() -> String {
@@ -160,6 +215,7 @@ struct ServerProtocolOptions {
     jls_rate_limit: u64,
     congestion: ShadowQuicCongestionConfig,
     zero_rtt: bool,
+    transport: ShadowQuicTransportOptions,
 }
 
 struct Running {
@@ -204,6 +260,7 @@ impl Lifecycle for ShadowQuicInbound {
                 jls_rate_limit: protocol.jls_rate_limit,
                 congestion: protocol.congestion,
                 zero_rtt: protocol.zero_rtt,
+                transport: protocol.transport,
             }) {
                 Ok(server) => Arc::new(server),
                 Err(sing_quic::Error::Io(error))
@@ -276,7 +333,8 @@ async fn run_server(
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
                     tokio::spawn(async move {
-                        match accepted {
+                        let result: Result<()> = async {
+                            match accepted {
                             Accepted::Stream(accepted) => {
                                 let destination = Address::new(
                                     accepted.destination.host(),
@@ -314,6 +372,11 @@ async fn run_server(
                                     )
                                     .await
                             }
+                            }
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "ShadowQuic routed session closed");
                         }
                     });
                 }
@@ -387,6 +450,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 password: options.password,
                 congestion: options.congestion_control.into_protocol()?,
                 zero_rtt: options.zero_rtt,
+                transport: options.quic.into_protocol()?,
             })?;
             Ok(Arc::new(ShadowQuicOutbound {
                 tag,
@@ -413,9 +477,19 @@ pub fn register(registry: &mut Registry) -> Result<()> {
             let server_name = (!options.server_name.is_empty()).then_some(options.server_name);
             let (jls_upstream_addr, jls_rate_limit) = options
                 .jls_upstream
-                .map(|upstream| (Some(upstream.addr), upstream.rate_limit))
+                .map(|upstream| {
+                    (
+                        Some(upstream.addr),
+                        if upstream.rate_limit == 0 {
+                            u64::MAX
+                        } else {
+                            upstream.rate_limit
+                        },
+                    )
+                })
                 .unwrap_or((None, u64::MAX));
             let congestion = options.congestion_control.into_protocol()?;
+            let transport = options.quic.into_protocol()?;
             Ok(Arc::new(ShadowQuicInbound {
                 tag,
                 prepared: Mutex::new(Some(PreparedServer {
@@ -427,6 +501,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                         jls_rate_limit,
                         congestion,
                         zero_rtt: options.zero_rtt,
+                        transport,
                     },
                 })),
                 router: context.router,
@@ -436,6 +511,47 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn parse_optional_duration(value: &str) -> Result<Option<Duration>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let duration = parse_duration(value)?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "duration is empty");
+    let mut total = 0.0f64;
+    let mut position = 0;
+    while position < value.len() {
+        let number_start = position;
+        while position < value.len()
+            && (value.as_bytes()[position].is_ascii_digit() || value.as_bytes()[position] == b'.')
+        {
+            position += 1;
+        }
+        anyhow::ensure!(position > number_start, "invalid duration: {value}");
+        let number: f64 = value[number_start..position].parse()?;
+        let unit_start = position;
+        while position < value.len() && value.as_bytes()[position].is_ascii_alphabetic() {
+            position += 1;
+        }
+        let multiplier = match &value[unit_start..position] {
+            "ns" => 1e-9,
+            "us" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86400.0,
+            unit => anyhow::bail!("invalid duration unit: {unit}"),
+        };
+        total += number * multiplier;
+    }
+    Ok(Duration::from_secs_f64(total))
 }
 
 #[cfg(test)]
@@ -473,5 +589,30 @@ mod tests {
             error.to_string(),
             "ShadowQuic Brutal bandwidth must be positive"
         );
+    }
+
+    #[test]
+    fn parses_shadowquic_transport_options() {
+        let options: ShadowQuicInboundOptions = serde_json::from_str(
+            r#"{
+                "listen": "::",
+                "listen_port": 443,
+                "initial_packet_size": 1400,
+                "max_concurrent_streams": 512,
+                "connection_receive_window": 30000000,
+                "stream_receive_window": 6000000,
+                "keep_alive_period": "5s",
+                "idle_timeout": "45s",
+                "disable_path_mtu_discovery": true,
+                "users": [{"name": "demo", "password": "secret"}]
+            }"#,
+        )
+        .unwrap();
+        let transport = options.quic.into_protocol().unwrap();
+        assert_eq!(transport.initial_packet_size, 1400);
+        assert_eq!(transport.max_concurrent_streams, 512);
+        assert_eq!(transport.keep_alive_period, Some(Duration::from_secs(5)));
+        assert_eq!(transport.idle_timeout, Some(Duration::from_secs(45)));
+        assert!(transport.disable_path_mtu_discovery);
     }
 }

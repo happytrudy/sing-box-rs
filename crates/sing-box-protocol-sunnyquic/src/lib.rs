@@ -2,6 +2,7 @@ use std::{
     io::Cursor,
     net::SocketAddr,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use sing_box_core::{
 };
 use sing_quic::sunnyquic::{
     Accepted, Client, ClientOptions, CongestionConfig, Server, ServerOptions, ShadowQuicPacket,
-    ShadowQuicPacketConnection, User,
+    ShadowQuicPacketConnection, TransportOptions as SunnyQuicTransportOptions, User,
 };
 use tokio::{sync::Mutex, sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,8 @@ struct SunnyQuicOutboundOptions {
     #[serde(default)]
     congestion_control: CongestionControlOptions,
     tls: OutboundTlsOptions,
+    #[serde(flatten)]
+    quic: SunnyQuicQuicOptions,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -58,6 +61,57 @@ struct SunnyQuicInboundOptions {
     #[serde(default)]
     congestion_control: CongestionControlOptions,
     tls: InboundTlsOptions,
+    #[serde(flatten)]
+    quic: SunnyQuicQuicOptions,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SunnyQuicQuicOptions {
+    #[serde(default = "default_initial_packet_size")]
+    initial_packet_size: u16,
+    #[serde(default = "default_max_concurrent_streams")]
+    max_concurrent_streams: u64,
+    #[serde(default = "default_connection_receive_window")]
+    connection_receive_window: u64,
+    #[serde(default = "default_stream_receive_window")]
+    stream_receive_window: u64,
+    #[serde(default)]
+    keep_alive_period: String,
+    #[serde(default = "default_idle_timeout")]
+    idle_timeout: String,
+    #[serde(default)]
+    disable_path_mtu_discovery: bool,
+}
+
+impl SunnyQuicQuicOptions {
+    fn into_protocol(self) -> Result<SunnyQuicTransportOptions> {
+        Ok(SunnyQuicTransportOptions {
+            initial_packet_size: self.initial_packet_size,
+            max_concurrent_streams: self.max_concurrent_streams,
+            connection_receive_window: self.connection_receive_window,
+            stream_receive_window: self.stream_receive_window,
+            keep_alive_period: parse_optional_duration(&self.keep_alive_period)?,
+            idle_timeout: parse_optional_duration(&self.idle_timeout)?,
+            disable_path_mtu_discovery: self.disable_path_mtu_discovery,
+        })
+    }
+}
+
+fn default_initial_packet_size() -> u16 {
+    1_300
+}
+fn default_max_concurrent_streams() -> u64 {
+    1_000
+}
+fn default_connection_receive_window() -> u64 {
+    20 * 1024 * 1024
+}
+fn default_stream_receive_window() -> u64 {
+    5_000_000
+}
+fn default_idle_timeout() -> String {
+    "30s".into()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -138,6 +192,7 @@ struct PreparedServer {
     users: Vec<User>,
     congestion: CongestionConfig,
     zero_rtt: bool,
+    transport: SunnyQuicTransportOptions,
 }
 
 struct Running {
@@ -222,6 +277,7 @@ impl Lifecycle for SunnyQuicInbound {
             users,
             congestion,
             zero_rtt,
+            transport,
         } = prepared;
         let (certificate, certificate_updates) = match certificate {
             CertificateSource::Static(certificate) => (certificate, None),
@@ -247,6 +303,7 @@ impl Lifecycle for SunnyQuicInbound {
                 private_key: certificate.private_key.clone(),
                 congestion,
                 zero_rtt,
+                transport,
             }) {
                 Ok(server) => Arc::new(server),
                 Err(sing_quic::Error::Io(error))
@@ -483,6 +540,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 ca_certificates,
                 congestion: options.congestion_control.into_protocol()?,
                 zero_rtt: options.zero_rtt,
+                transport: options.quic.into_protocol()?,
             })?;
             Ok(Arc::new(SunnyQuicOutbound {
                 tag,
@@ -550,6 +608,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                     users,
                     congestion: options.congestion_control.into_protocol()?,
                     zero_rtt: options.zero_rtt,
+                    transport: options.quic.into_protocol()?,
                 })),
                 router: context.router,
                 running: Mutex::new(None),
@@ -583,6 +642,47 @@ fn parse_private_key(data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+fn parse_optional_duration(value: &str) -> Result<Option<Duration>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let duration = parse_duration(value)?;
+    Ok((!duration.is_zero()).then_some(duration))
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "duration is empty");
+    let mut total = 0.0f64;
+    let mut position = 0;
+    while position < value.len() {
+        let number_start = position;
+        while position < value.len()
+            && (value.as_bytes()[position].is_ascii_digit() || value.as_bytes()[position] == b'.')
+        {
+            position += 1;
+        }
+        anyhow::ensure!(position > number_start, "invalid duration: {value}");
+        let number: f64 = value[number_start..position].parse()?;
+        let unit_start = position;
+        while position < value.len() && value.as_bytes()[position].is_ascii_alphabetic() {
+            position += 1;
+        }
+        let multiplier = match &value[unit_start..position] {
+            "ns" => 1e-9,
+            "us" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86400.0,
+            unit => anyhow::bail!("invalid duration unit: {unit}"),
+        };
+        total += number * multiplier;
+    }
+    Ok(Duration::from_secs_f64(total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +700,32 @@ mod tests {
                 disable_loss_compensation: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_sunnyquic_transport_options() {
+        let options: SunnyQuicOutboundOptions = serde_json::from_str(
+            r#"{
+                "server": "sunny.example.com",
+                "server_port": 443,
+                "username": "demo",
+                "password": "secret",
+                "initial_packet_size": 1380,
+                "max_concurrent_streams": 256,
+                "connection_receive_window": 25000000,
+                "stream_receive_window": 5500000,
+                "keep_alive_period": "4s",
+                "idle_timeout": "40s",
+                "disable_path_mtu_discovery": true,
+                "tls": {"server_name": "sunny.example.com"}
+            }"#,
+        )
+        .unwrap();
+        let transport = options.quic.into_protocol().unwrap();
+        assert_eq!(transport.initial_packet_size, 1380);
+        assert_eq!(transport.max_concurrent_streams, 256);
+        assert_eq!(transport.keep_alive_period, Some(Duration::from_secs(4)));
+        assert_eq!(transport.idle_timeout, Some(Duration::from_secs(40)));
+        assert!(transport.disable_path_mtu_discovery);
     }
 }

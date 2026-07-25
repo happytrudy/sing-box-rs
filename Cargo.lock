@@ -1549,7 +1549,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sing-box-core"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-anytls"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-cloudflared"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-hysteria2"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1636,11 +1636,12 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-shadowquic"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "serde",
+ "serde_json",
  "sing-box-core",
  "sing-quic",
  "tokio",
@@ -1650,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-snell"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1665,12 +1666,13 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-sunnyquic"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sing-box-core",
  "sing-quic",
  "tokio",
@@ -1680,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-protocol-vless"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1695,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-rs"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1730,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "sing-box-tls"
-version = "0.1.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
