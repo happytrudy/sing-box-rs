@@ -64,14 +64,6 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-          if git -C sing-box-rs rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-            tagged_commit="$(git -C sing-box-rs rev-list -n 1 "$tag")"
-            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
-              echo "$tag already points to $tagged_commit. Change [workspace.package].version in Cargo.toml before releasing $GITHUB_SHA." >&2
-              exit 1
-            fi
-          fi
-
           {
             echo "### Manual release"
             echo ""
@@ -256,13 +248,18 @@ jobs:
         run: |
           mapfile -t assets < <(find dist -maxdepth 1 -type f -print | sort)
           if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh api --method PATCH \
+              "repos/$REPOSITORY/git/refs/tags/$TAG" \
+              --raw-field sha="$GITHUB_SHA" \
+              --field force=true \
+              >/dev/null
             gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPOSITORY"
             gh release edit "$TAG" \
               --repo "$REPOSITORY" \
               --title "sing-box-rs $TAG" \
               --draft="$DRAFT" \
               --prerelease="$PRERELEASE"
-            echo "Updated assets on existing release $TAG" >> "$GITHUB_STEP_SUMMARY"
+            echo "Replaced $TAG with artifacts built from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
