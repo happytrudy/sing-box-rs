@@ -144,10 +144,10 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             platform: linux-amd64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             platform: linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -170,13 +170,34 @@ jobs:
       - name: Install stable Rust
         shell: bash
         run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add "${{ matrix.target }}"
+          target_env="${{ matrix.target }}"
+          target_env="${target_env//-/_}"
+          target_env="${target_env^^}"
+          echo "CARGO_TARGET_${target_env}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_env}_RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_TARGET=${{ matrix.target }}" >> "$GITHUB_ENV"
 
-      - name: Build release binary
+      - name: Build fully static release binary
         working-directory: sing-box-rs
-        run: cargo build --release --package sing-box-rs --target "${{ matrix.target }}"
+        run: |
+          cargo build --release --package sing-box-rs --target "${{ matrix.target }}"
+          binary="target/${{ matrix.target }}/release/sing-box-rs"
+          file "$binary"
+          readelf -d "$binary" 2>/dev/null | grep -q 'NEEDED' && {
+            echo "release binary unexpectedly has dynamic library dependencies" >&2
+            exit 1
+          }
+          readelf -l "$binary" 2>/dev/null | grep -q 'Requesting program interpreter' && {
+            echo "release binary unexpectedly has an ELF interpreter" >&2
+            exit 1
+          }
+          file "$binary" | grep -Eq 'statically linked|static-pie linked'
 
       - name: Package release archive
         shell: bash

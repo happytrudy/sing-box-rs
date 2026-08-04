@@ -147,7 +147,18 @@ impl Dialer for ShadowQuicOutbound {
         );
         let destination =
             sing_quic::Address::new(session.destination.host.clone(), session.destination.port)?;
-        Ok(Box::new(self.client.connect(destination).await?))
+        match self.client.connect(destination.clone()).await {
+            Ok(stream) => Ok(Box::new(stream)),
+            Err(error) => {
+                tracing::warn!(
+                    outbound = %self.tag,
+                    destination = %destination,
+                    %error,
+                    "ShadowQuic outbound connection failed"
+                );
+                Err(error.into())
+            }
+        }
     }
 }
 

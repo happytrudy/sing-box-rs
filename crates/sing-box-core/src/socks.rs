@@ -75,7 +75,7 @@ impl Lifecycle for SocksInbound {
                                 let tag = tag.clone();
                                 tokio::spawn(async move {
                                     if let Err(error) = handle_connection(stream, source, tag, router).await {
-                                        tracing::debug!(%source, %error, "SOCKS connection closed");
+                                        tracing::warn!(%source, %error, "SOCKS connection failed");
                                     }
                                 });
                             }

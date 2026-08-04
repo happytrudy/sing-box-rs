@@ -431,6 +431,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Manual release
 
+Linux release binaries use the musl targets (`x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl`) and are statically linked, so they do not require
+the target system's glibc version.
+
 The `Manual Release` workflow under GitHub Actions publishes Linux AMD64 and
 ARM64 archives. It reads the release version from `[workspace.package]` in the
 root `Cargo.toml`; for example, version `0.1.3` produces release tag `v0.1.3`.
