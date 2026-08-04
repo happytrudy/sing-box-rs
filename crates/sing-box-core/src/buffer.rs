@@ -18,7 +18,7 @@ impl PacketBufferPool {
         let mut buffer = self
             .buffers
             .lock()
-            .expect("packet buffer pool lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop()
             .unwrap_or_else(|| vec![0; UDP_BUFFER_SIZE]);
         buffer.resize(UDP_BUFFER_SIZE, 0);
@@ -33,7 +33,10 @@ impl PacketBufferPool {
             return;
         }
         buffer.clear();
-        let mut buffers = self.buffers.lock().expect("packet buffer pool lock");
+        let mut buffers = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if buffers.len() < MAX_RETAINED_BUFFERS {
             buffers.push(buffer);
         }
@@ -41,7 +44,10 @@ impl PacketBufferPool {
 
     #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
-        self.buffers.lock().expect("packet buffer pool lock").len()
+        self.buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -90,5 +96,19 @@ mod tests {
 
         let second = pool.acquire();
         assert_eq!(second.buffer.as_ref().unwrap().as_ptr(), first_ptr);
+    }
+
+    #[test]
+    fn poisoned_pool_does_not_panic_during_packet_cleanup() {
+        let pool = PacketBufferPool::new();
+        let poison_target = pool.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_target.buffers.lock().unwrap();
+            panic!("poison packet buffer pool");
+        });
+
+        let lease = pool.acquire();
+        drop(lease);
+        assert_eq!(pool.available(), 1);
     }
 }
