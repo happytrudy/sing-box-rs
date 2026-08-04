@@ -224,6 +224,7 @@ async fn handle_udp_associate(
         socket,
         control_source_ip: source.ip(),
         peer: Mutex::new(None),
+        buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
     });
     let session = Session::inbound(Network::Udp, source, destination, tag, "socks", None);
 
@@ -241,6 +242,7 @@ struct SocksPacketConnection {
     socket: Arc<UdpSocket>,
     control_source_ip: IpAddr,
     peer: Mutex<Option<SocketAddr>>,
+    buffer: Mutex<Vec<u8>>,
 }
 
 #[async_trait]
@@ -259,7 +261,7 @@ impl PacketConnection for SocksPacketConnection {
     }
 
     async fn recv(&self) -> Result<Packet> {
-        let mut buffer = vec![0u8; u16::MAX as usize];
+        let mut buffer = self.buffer.lock().await;
         loop {
             let (length, source) = self.socket.recv_from(&mut buffer).await?;
             if source.ip() != self.control_source_ip {

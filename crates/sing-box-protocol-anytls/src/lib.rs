@@ -438,7 +438,7 @@ impl Lifecycle for AnyTlsOutbound {
         for session in sessions {
             session.close();
             session.clear_streams().await;
-            let _ = timeout(Duration::from_secs(1), session.done.notified()).await;
+            session.done.notified().await;
         }
         Ok(())
     }
@@ -1207,7 +1207,7 @@ impl ClientSession {
             }
             reader_session.close();
             reader_session.clear_streams().await;
-            reader_session.done.notify_waiters();
+            reader_session.done.notify_one();
         });
         if let Err(error) = tx
             .send(Frame {

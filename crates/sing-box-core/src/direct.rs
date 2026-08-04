@@ -3,7 +3,7 @@ use std::{net::IpAddr, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::Mutex};
 
 use crate::{
     Address, BoxPacketConnection, BoxStream, Dialer, Lifecycle, Outbound, OutboundBuildContext,
@@ -41,9 +41,12 @@ impl Outbound for DirectOutbound {
     async fn connect_packet(&self, _session: &Session) -> Result<BoxPacketConnection> {
         let ipv4 = UdpSocket::bind("0.0.0.0:0").await?;
         let ipv6 = UdpSocket::bind("[::]:0").await.ok();
+        let has_ipv6 = ipv6.is_some();
         Ok(Arc::new(DirectPacketConnection {
             ipv4,
             ipv6,
+            ipv4_buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
+            ipv6_buffer: has_ipv6.then(|| Mutex::new(vec![0u8; u16::MAX as usize])),
             dialer: self.dialer.clone(),
         }))
     }
@@ -52,6 +55,8 @@ impl Outbound for DirectOutbound {
 struct DirectPacketConnection {
     ipv4: UdpSocket,
     ipv6: Option<UdpSocket>,
+    ipv4_buffer: Mutex<Vec<u8>>,
+    ipv6_buffer: Option<Mutex<Vec<u8>>>,
     dialer: SystemDialer,
 }
 
@@ -85,25 +90,25 @@ impl PacketConnection for DirectPacketConnection {
     }
 
     async fn recv(&self) -> Result<Packet> {
-        let (mut buffer, length, source) = if let Some(ipv6) = &self.ipv6 {
-            let mut ipv4_buffer = vec![0u8; u16::MAX as usize];
-            let mut ipv6_buffer = vec![0u8; u16::MAX as usize];
-            tokio::select! {
-                result = self.ipv4.recv_from(&mut ipv4_buffer) => {
-                    let (length, source) = result?;
-                    (ipv4_buffer, length, source)
+        let (buffer, source) =
+            if let (Some(ipv6), Some(ipv6_buffer)) = (&self.ipv6, &self.ipv6_buffer) {
+                let mut ipv4_buffer = self.ipv4_buffer.lock().await;
+                let mut ipv6_buffer = ipv6_buffer.lock().await;
+                tokio::select! {
+                    result = self.ipv4.recv_from(&mut ipv4_buffer) => {
+                        let (length, source) = result?;
+                        (ipv4_buffer[..length].to_vec(), source)
+                    }
+                    result = ipv6.recv_from(&mut ipv6_buffer) => {
+                        let (length, source) = result?;
+                        (ipv6_buffer[..length].to_vec(), source)
+                    }
                 }
-                result = ipv6.recv_from(&mut ipv6_buffer) => {
-                    let (length, source) = result?;
-                    (ipv6_buffer, length, source)
-                }
-            }
-        } else {
-            let mut buffer = vec![0u8; u16::MAX as usize];
-            let (length, source) = self.ipv4.recv_from(&mut buffer).await?;
-            (buffer, length, source)
-        };
-        buffer.truncate(length);
+            } else {
+                let mut buffer = self.ipv4_buffer.lock().await;
+                let (length, source) = self.ipv4.recv_from(&mut buffer).await?;
+                (buffer[..length].to_vec(), source)
+            };
         let source_ip = match source.ip() {
             IpAddr::V6(ip) => ip
                 .to_ipv4_mapped()
