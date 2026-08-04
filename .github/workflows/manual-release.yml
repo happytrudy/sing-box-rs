@@ -167,6 +167,14 @@ jobs:
           quinn_ref: ${{ needs.metadata.outputs.quinn_ref }}
           rustls_ref: ${{ needs.metadata.outputs.rustls_ref }}
 
+      - name: Apply musl libc compatibility fix to Quinn UDP
+        shell: bash
+        run: |
+          file="quinn/quinn-udp/src/linux.rs"
+          if grep -q 'if cmsg.cmsg_len < required' "$file"; then
+            sed -i 's/if cmsg\.cmsg_len < required/if (cmsg.cmsg_len as usize) < required/' "$file"
+          fi
+
       - name: Install stable Rust
         shell: bash
         run: |
