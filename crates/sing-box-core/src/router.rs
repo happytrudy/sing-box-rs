@@ -746,7 +746,7 @@ fn parse_duration(value: &str) -> Result<Duration> {
         remaining = &remaining[unit_end..];
     }
     anyhow::ensure!(seconds.is_finite(), "duration is too large");
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).context("duration is too large")
 }
 
 enum HeadlessRule {

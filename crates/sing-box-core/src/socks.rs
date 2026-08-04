@@ -15,8 +15,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Address, Inbound, InboundBuildContext, Lifecycle, Network, Packet, PacketConnection, Registry,
-    Router, Session, StartStage, bind_tcp_listeners,
+    Address, ConnectionTasks, Inbound, InboundBuildContext, Lifecycle, Network, Packet,
+    PacketConnection, Registry, Router, Session, StartStage, bind_tcp_listeners,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -35,6 +35,7 @@ fn default_listen() -> String {
 struct Running {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
+    connection_tasks: ConnectionTasks,
 }
 
 struct SocksInbound {
@@ -60,9 +61,11 @@ impl Lifecycle for SocksInbound {
         let local_addr = listeners[0].local_addr()?;
         *self.local_addr.write().expect("SOCKS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
+        let connection_tasks = ConnectionTasks::new();
         let mut tasks = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let task_cancel = cancel.clone();
+            let connection_tasks = connection_tasks.clone();
             let router = Arc::clone(&self.router);
             let tag = self.tag.clone();
             tasks.push(tokio::spawn(async move {
@@ -73,9 +76,15 @@ impl Lifecycle for SocksInbound {
                             Ok((stream, source)) => {
                                 let router = Arc::clone(&router);
                                 let tag = tag.clone();
-                                tokio::spawn(async move {
-                                    if let Err(error) = handle_connection(stream, source, tag, router).await {
-                                        tracing::warn!(%source, %error, "SOCKS connection failed");
+                                let connection_cancel = task_cancel.clone();
+                                connection_tasks.spawn(async move {
+                                    tokio::select! {
+                                        _ = connection_cancel.cancelled() => {}
+                                        result = handle_connection(stream, source, tag, router) => {
+                                            if let Err(error) = result {
+                                                tracing::warn!(%source, %error, "SOCKS connection failed");
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -88,7 +97,11 @@ impl Lifecycle for SocksInbound {
                 }
             }));
         }
-        *self.running.lock().await = Some(Running { cancel, tasks });
+        *self.running.lock().await = Some(Running {
+            cancel,
+            tasks,
+            connection_tasks,
+        });
         tracing::info!(tag = %self.tag, %local_addr, "started SOCKS inbound");
         Ok(())
     }
@@ -99,6 +112,7 @@ impl Lifecycle for SocksInbound {
             for task in running.tasks {
                 task.await?;
             }
+            running.connection_tasks.join().await;
         }
         Ok(())
     }

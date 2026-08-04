@@ -9,9 +9,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
-    Address, BoxStream, Certificate, Dialer, Inbound, InboundBuildContext, Lifecycle, Network,
-    Outbound, OutboundBuildContext, Packet, PacketConnection, Registry, Router, Session,
-    StartStage, listen_addresses,
+    Address, BoxStream, Certificate, ConnectionTasks, Dialer, Inbound, InboundBuildContext,
+    Lifecycle, Network, Outbound, OutboundBuildContext, Packet, PacketConnection, Registry, Router,
+    Session, StartStage, listen_addresses,
 };
 use sing_quic::Error as SingQuicError;
 use sing_quic::hysteria2::{
@@ -185,6 +185,7 @@ struct Running {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     servers: Vec<Arc<Server>>,
+    connection_tasks: ConnectionTasks,
 }
 
 struct Hysteria2Inbound {
@@ -269,12 +270,14 @@ impl Lifecycle for Hysteria2Inbound {
         let local_addr = servers[0].local_addr()?;
         *self.local_addr.write().expect("Hysteria2 address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
+        let connection_tasks = ConnectionTasks::new();
         let mut tasks = servers
             .iter()
             .map(|server| {
                 tokio::spawn(run_server(
                     Arc::clone(server),
                     cancel.clone(),
+                    connection_tasks.clone(),
                     Arc::clone(&self.router),
                     self.tag.clone(),
                 ))
@@ -292,6 +295,7 @@ impl Lifecycle for Hysteria2Inbound {
             cancel,
             tasks,
             servers,
+            connection_tasks,
         });
         tracing::info!(tag = %self.tag, %local_addr, "started Hysteria2 inbound");
         Ok(())
@@ -306,6 +310,7 @@ impl Lifecycle for Hysteria2Inbound {
             for server in running.servers {
                 server.close().await;
             }
+            running.connection_tasks.join().await;
         }
         Ok(())
     }
@@ -344,6 +349,7 @@ async fn watch_certificate_updates(
 async fn run_server(
     server: Arc<Server>,
     cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
     router: Arc<Router>,
     tag: String,
 ) {
@@ -354,71 +360,75 @@ async fn run_server(
                 Ok(accepted) => {
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
-                    tokio::spawn(async move {
-                        let result: Result<()> = async {
-                            match accepted {
-                                Accepted::Stream(accepted) => {
-                                    let destination = Address::new(
-                                        accepted.destination.host(),
-                                        accepted.destination.port(),
-                                    )?;
-                                    let mut session = Session::inbound(
-                                        Network::Tcp,
-                                        accepted.source,
-                                        destination,
-                                        tag,
-                                        "hysteria2",
-                                        Some(accepted.user),
-                                    );
-                                    let mut stream = accepted.stream;
-                                    match router.connect(&mut session).await {
-                                        Ok(outbound) => {
-                                            stream.handshake_success().await?;
-                                            router.relay(session, Box::new(stream), outbound).await
-                                        }
-                                        Err(error) => {
-                                            let message = error.to_string();
-                                            if let Err(handshake_error) =
-                                                stream.handshake_failure(&message).await
-                                            {
-                                                tracing::debug!(
-                                                    %handshake_error,
-                                                    "failed to report Hysteria2 handshake failure"
-                                                );
+                    let connection_cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
+                        tokio::select! {
+                            _ = connection_cancel.cancelled() => {}
+                            result = async {
+                                match accepted {
+                                    Accepted::Stream(accepted) => {
+                                        let destination = Address::new(
+                                            accepted.destination.host(),
+                                            accepted.destination.port(),
+                                        )?;
+                                        let mut session = Session::inbound(
+                                            Network::Tcp,
+                                            accepted.source,
+                                            destination,
+                                            tag,
+                                            "hysteria2",
+                                            Some(accepted.user),
+                                        );
+                                        let mut stream = accepted.stream;
+                                        match router.connect(&mut session).await {
+                                            Ok(outbound) => {
+                                                stream.handshake_success().await?;
+                                                router.relay(session, Box::new(stream), outbound).await
                                             }
-                                            Err(error)
+                                            Err(error) => {
+                                                let message = error.to_string();
+                                                if let Err(handshake_error) =
+                                                    stream.handshake_failure(&message).await
+                                                {
+                                                    tracing::debug!(
+                                                        %handshake_error,
+                                                        "failed to report Hysteria2 handshake failure"
+                                                    );
+                                                }
+                                                Err(error)
+                                            }
+                                        }
+                                    }
+                                    Accepted::Packet(accepted) => {
+                                        let destination = Address::new(
+                                            accepted.destination.host(),
+                                            accepted.destination.port(),
+                                        )?;
+                                        let session = Session::inbound(
+                                            Network::Udp,
+                                            accepted.source,
+                                            destination,
+                                            tag,
+                                            "hysteria2",
+                                            Some(accepted.user),
+                                        );
+                                        let timeout_connection = Arc::clone(&accepted.connection);
+                                        tokio::select! {
+                                            result = router.route_packet(
+                                                session,
+                                                Arc::new(Hysteria2PacketAdapter {
+                                                    inner: accepted.connection,
+                                                }),
+                                            ) => result,
+                                            _ = timeout_connection.wait_inactive(DEFAULT_UDP_TIMEOUT) => Ok(()),
                                         }
                                     }
                                 }
-                                Accepted::Packet(accepted) => {
-                                    let destination = Address::new(
-                                        accepted.destination.host(),
-                                        accepted.destination.port(),
-                                    )?;
-                                    let session = Session::inbound(
-                                        Network::Udp,
-                                        accepted.source,
-                                        destination,
-                                        tag,
-                                        "hysteria2",
-                                        Some(accepted.user),
-                                    );
-                                    let timeout_connection = Arc::clone(&accepted.connection);
-                                    tokio::select! {
-                                        result = router.route_packet(
-                                            session,
-                                            Arc::new(Hysteria2PacketAdapter {
-                                                inner: accepted.connection,
-                                            }),
-                                        ) => result,
-                                        _ = timeout_connection.wait_inactive(DEFAULT_UDP_TIMEOUT) => Ok(()),
-                                    }
+                            } => {
+                                if let Err(error) = result {
+                                    tracing::debug!(%error, "Hysteria2 routed session closed");
                                 }
                             }
-                        }
-                        .await;
-                        if let Err(error) = result {
-                            tracing::debug!(%error, "Hysteria2 routed session closed");
                         }
                     });
                 }
@@ -681,7 +691,7 @@ fn parse_duration(value: &str) -> Result<Duration> {
         total += number * multiplier;
     }
     anyhow::ensure!(total >= 0.0, "duration cannot be negative");
-    Ok(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).context("duration is too large")
 }
 
 fn parse_certificates(data: &[u8]) -> Result<Vec<Vec<u8>>> {

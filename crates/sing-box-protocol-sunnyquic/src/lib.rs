@@ -9,9 +9,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
-    Address, BoxPacketConnection, BoxStream, Certificate, Dialer, Inbound, InboundBuildContext,
-    Lifecycle, Network, Outbound, OutboundBuildContext, Packet, PacketConnection, Registry, Router,
-    Session, StartStage, listen_addresses,
+    Address, BoxPacketConnection, BoxStream, Certificate, ConnectionTasks, Dialer, Inbound,
+    InboundBuildContext, Lifecycle, Network, Outbound, OutboundBuildContext, Packet,
+    PacketConnection, Registry, Router, Session, StartStage, listen_addresses,
 };
 use sing_quic::sunnyquic::{
     Accepted, Client, ClientOptions, CongestionConfig, Server, ServerOptions, ShadowQuicPacket,
@@ -199,6 +199,7 @@ struct Running {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     servers: Vec<Arc<Server>>,
+    connection_tasks: ConnectionTasks,
 }
 
 struct SunnyQuicInbound {
@@ -328,12 +329,14 @@ impl Lifecycle for SunnyQuicInbound {
         let local_addr = servers[0].local_addr()?;
         *self.local_addr.write().expect("SunnyQUIC address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
+        let connection_tasks = ConnectionTasks::new();
         let mut tasks = servers
             .iter()
             .map(|server| {
                 tokio::spawn(run_server(
                     Arc::clone(server),
                     cancel.clone(),
+                    connection_tasks.clone(),
                     Arc::clone(&self.router),
                     self.tag.clone(),
                 ))
@@ -351,6 +354,7 @@ impl Lifecycle for SunnyQuicInbound {
             cancel,
             tasks,
             servers,
+            connection_tasks,
         });
         tracing::info!(tag = %self.tag, %local_addr, "started SunnyQUIC inbound");
         Ok(())
@@ -365,6 +369,7 @@ impl Lifecycle for SunnyQuicInbound {
             for server in running.servers {
                 server.close().await;
             }
+            running.connection_tasks.join().await;
         }
         Ok(())
     }
@@ -416,6 +421,7 @@ async fn watch_certificate_updates(
 async fn run_server(
     server: Arc<Server>,
     cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
     router: Arc<Router>,
     tag: String,
 ) {
@@ -426,49 +432,61 @@ async fn run_server(
                 Ok(Accepted::Stream(accepted)) => {
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
-                    tokio::spawn(async move {
-                        let destination = match Address::new(accepted.destination.host(), accepted.destination.port()) {
-                            Ok(destination) => destination,
-                            Err(error) => { tracing::debug!(%error, "invalid SunnyQUIC TCP destination"); return; }
-                        };
-                        let session = Session::inbound(
-                            Network::Tcp,
-                            accepted.source,
-                            destination,
-                            tag,
-                            "sunnyquic",
-                            Some(accepted.user),
-                        );
-                        if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
-                            tracing::debug!(%error, "SunnyQUIC TCP session closed");
+                    let connection_cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
+                        tokio::select! {
+                            _ = connection_cancel.cancelled() => {}
+                            _ = async {
+                                let destination = match Address::new(accepted.destination.host(), accepted.destination.port()) {
+                                    Ok(destination) => destination,
+                                    Err(error) => { tracing::debug!(%error, "invalid SunnyQUIC TCP destination"); return; }
+                                };
+                                let session = Session::inbound(
+                                    Network::Tcp,
+                                    accepted.source,
+                                    destination,
+                                    tag,
+                                    "sunnyquic",
+                                    Some(accepted.user),
+                                );
+                                if let Err(error) = router.route(session, Box::new(accepted.stream)).await {
+                                    tracing::debug!(%error, "SunnyQUIC TCP session closed");
+                                }
+                            } => {}
                         }
                     });
                 }
                 Ok(Accepted::Packet(accepted)) => {
                     let router = Arc::clone(&router);
                     let tag = tag.clone();
-                    tokio::spawn(async move {
-                        let destination = match Address::new(accepted.destination.host(), accepted.destination.port()) {
-                            Ok(destination) => destination,
-                            Err(error) => { tracing::debug!(%error, "invalid SunnyQUIC UDP destination"); return; }
-                        };
-                        let session = Session::inbound(
-                            Network::Udp,
-                            accepted.source,
-                            destination,
-                            tag,
-                            "sunnyquic",
-                            Some(accepted.user),
-                        );
-                        let connection = Arc::clone(&accepted.connection);
-                        let result = router.route_packet(
-                            session,
-                            Arc::new(SunnyQuicPacketAdapter { inner: accepted.connection }),
-                        ).await;
-                        if let Err(error) = result {
-                            tracing::debug!(%error, "SunnyQUIC UDP session closed");
+                    let connection_cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
+                        tokio::select! {
+                            _ = connection_cancel.cancelled() => {}
+                            _ = async {
+                                let destination = match Address::new(accepted.destination.host(), accepted.destination.port()) {
+                                    Ok(destination) => destination,
+                                    Err(error) => { tracing::debug!(%error, "invalid SunnyQUIC UDP destination"); return; }
+                                };
+                                let session = Session::inbound(
+                                    Network::Udp,
+                                    accepted.source,
+                                    destination,
+                                    tag,
+                                    "sunnyquic",
+                                    Some(accepted.user),
+                                );
+                                let connection = Arc::clone(&accepted.connection);
+                                let result = router.route_packet(
+                                    session,
+                                    Arc::new(SunnyQuicPacketAdapter { inner: accepted.connection }),
+                                ).await;
+                                if let Err(error) = result {
+                                    tracing::debug!(%error, "SunnyQUIC UDP session closed");
+                                }
+                                drop(connection);
+                            } => {}
                         }
-                        drop(connection);
                     });
                 }
                 Err(error) => {
@@ -680,7 +698,7 @@ fn parse_duration(value: &str) -> Result<Duration> {
         };
         total += number * multiplier;
     }
-    Ok(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).context("duration is too large")
 }
 
 #[cfg(test)]

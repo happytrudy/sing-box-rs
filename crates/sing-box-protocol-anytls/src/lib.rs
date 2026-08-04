@@ -21,15 +21,15 @@ use rustls::{
 };
 use serde::Deserialize;
 use sing_box_core::{
-    Address, BoxPacketConnection, BoxStream, Certificate, Inbound, InboundBuildContext, Lifecycle,
-    Network, Outbound, OutboundBuildContext, Packet, PacketConnection, Registry, Router, Session,
-    StartStage, bind_tcp_listeners,
+    Address, BoxPacketConnection, BoxStream, Certificate, ConnectionTasks, Inbound,
+    InboundBuildContext, Lifecycle, Network, Outbound, OutboundBuildContext, Packet,
+    PacketConnection, Registry, Router, Session, StartStage, bind_tcp_listeners,
 };
 use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, RwLock, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
     time::timeout,
 };
@@ -53,6 +53,7 @@ const AUTH_PADDING: usize = 30;
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UOT_MAGIC: &str = "sp.v2.udp-over-tcp.arpa";
 const UOT_MAX_PACKET: usize = u16::MAX as usize;
+const MAX_PADDING_SIZE: usize = 1024 * 1024;
 const DEFAULT_PADDING_SCHEME: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 
 #[derive(Clone, Debug)]
@@ -101,6 +102,7 @@ impl PaddingScheme {
                 let min: usize = min.parse()?;
                 let max: usize = max.parse()?;
                 anyhow::ensure!(min <= max, "AnyTLS padding range is reversed");
+                anyhow::ensure!(max <= MAX_PADDING_SIZE, "AnyTLS padding range is too large");
                 rules.push(PaddingInstruction::Range { min, max });
             }
             anyhow::ensure!(!rules.is_empty(), "AnyTLS padding rule is empty");
@@ -306,6 +308,7 @@ enum ServerAcceptor {
 struct RunningInbound {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
+    connection_tasks: ConnectionTasks,
 }
 
 struct AnyTlsInbound {
@@ -333,6 +336,7 @@ struct AnyTlsOutbound {
     min_idle_session: usize,
     system_dialer: sing_box_core::SystemDialer,
     sessions: Arc<Mutex<Vec<Arc<ClientSession>>>>,
+    connect_lock: Mutex<()>,
     running: Mutex<Option<RunningOutbound>>,
     padding: Arc<RwLock<PaddingScheme>>,
 }
@@ -351,6 +355,12 @@ struct Frame {
 struct ClientStream {
     incoming: mpsc::Sender<Vec<u8>>,
     synack: Option<oneshot::Sender<Result<()>>>,
+    cancel: CancellationToken,
+}
+
+struct ServerStream {
+    incoming: mpsc::Sender<Vec<u8>>,
+    cancel: CancellationToken,
 }
 
 struct ClientSession {
@@ -359,6 +369,8 @@ struct ClientSession {
     next_stream_id: AtomicU32,
     active: AtomicUsize,
     closed: AtomicBool,
+    cancel: CancellationToken,
+    done: Notify,
     supports_v2: AtomicBool,
     last_used: Mutex<Instant>,
     padding: Arc<RwLock<PaddingScheme>>,
@@ -388,6 +400,7 @@ impl Lifecycle for AnyTlsOutbound {
                         let now = Instant::now();
                         let mut sessions = sessions.lock().await;
                         let mut idle = sessions.iter().filter(|session| session.active.load(Ordering::Acquire) == 0).count();
+                        let mut retired = Vec::new();
                         sessions.retain(|session| {
                             if session.closed.load(Ordering::Acquire) {
                                 return false;
@@ -396,9 +409,17 @@ impl Lifecycle for AnyTlsOutbound {
                                 return true;
                             }
                             let keep = session.last_used.try_lock().map(|last| now.duration_since(*last) <= timeout).unwrap_or(true);
-                            if !keep { idle -= 1; }
+                            if !keep {
+                                idle -= 1;
+                                retired.push(Arc::clone(session));
+                            }
                             keep
                         });
+                        drop(sessions);
+                        for session in retired {
+                            session.close();
+                            session.clear_streams().await;
+                        }
                     }
                 }
             }
@@ -416,6 +437,8 @@ impl Lifecycle for AnyTlsOutbound {
         let sessions = self.sessions.lock().await.drain(..).collect::<Vec<_>>();
         for session in sessions {
             session.close();
+            session.clear_streams().await;
+            let _ = timeout(Duration::from_secs(1), session.done.notified()).await;
         }
         Ok(())
     }
@@ -447,6 +470,13 @@ impl AnyTlsOutbound {
                     .map(|last_used| now.duration_since(*last_used) < self.idle_session_timeout)
                     .unwrap_or(true)
         });
+        if let Some(client) = sessions.last().cloned() {
+            return Ok(client);
+        }
+        drop(sessions);
+        let _connect_lock = self.connect_lock.lock().await;
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|candidate| !candidate.closed.load(Ordering::Acquire));
         if let Some(client) = sessions.last().cloned() {
             return Ok(client);
         }
@@ -528,12 +558,14 @@ impl Lifecycle for AnyTlsInbound {
         let local_addr = listeners[0].local_addr()?;
         *self.local_addr.write().expect("AnyTLS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
+        let connection_tasks = ConnectionTasks::new();
         let acceptor = Arc::new(RwLock::new(acceptor_value));
         let mut tasks = Vec::with_capacity(listeners.len());
         for listener in listeners {
             tasks.push(tokio::spawn(run_inbound_listener(
                 listener,
                 cancel.clone(),
+                connection_tasks.clone(),
                 Arc::clone(&self.router),
                 self.tag.clone(),
                 Arc::clone(&self.users),
@@ -549,7 +581,11 @@ impl Lifecycle for AnyTlsInbound {
                 cancel.clone(),
             )));
         }
-        *self.running.lock().await = Some(RunningInbound { cancel, tasks });
+        *self.running.lock().await = Some(RunningInbound {
+            cancel,
+            tasks,
+            connection_tasks,
+        });
         tracing::info!(tag = %self.tag, %local_addr, "started AnyTLS inbound");
         Ok(())
     }
@@ -560,6 +596,7 @@ impl Lifecycle for AnyTlsInbound {
             for task in running.tasks {
                 task.await?;
             }
+            running.connection_tasks.join().await;
         }
         Ok(())
     }
@@ -603,6 +640,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 min_idle_session: options.min_idle_session,
                 system_dialer: context.system_dialer,
                 sessions: Arc::new(Mutex::new(Vec::new())),
+                connect_lock: Mutex::new(()),
                 running: Mutex::new(None),
                 padding: Arc::new(RwLock::new(PaddingScheme::parse("")?)),
             }) as Arc<dyn Outbound>)
@@ -712,9 +750,11 @@ pub fn register(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inbound_listener(
     listener: TcpListener,
     cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
     router: Arc<Router>,
     tag: String,
     users: Arc<HashMap<[u8; 32], String>>,
@@ -731,9 +771,16 @@ async fn run_inbound_listener(
                     let acceptor = Arc::new(acceptor.read().await.clone());
                     let tag = tag.clone();
                     let padding_scheme = padding_scheme.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = handle_inbound_connection(stream, source, router, tag, users, acceptor, padding_scheme).await {
-                            tracing::debug!(%source, %error, error_chain = ?error, "AnyTLS connection closed");
+                    let connection_cancel = cancel.child_token();
+                    connection_tasks.spawn(async move {
+                        tokio::select! {
+                            _ = connection_cancel.cancelled() => {}
+                            result = handle_inbound_connection(stream, source, router, tag, users, acceptor, padding_scheme, connection_cancel.clone()) => {
+                                connection_cancel.cancel();
+                                if let Err(error) = result {
+                                    tracing::debug!(%source, %error, error_chain = ?error, "AnyTLS connection closed");
+                                }
+                            }
                         }
                     });
                 }
@@ -766,6 +813,7 @@ async fn watch_certificate_updates(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound_connection(
     stream: TcpStream,
     source: SocketAddr,
@@ -774,6 +822,7 @@ async fn handle_inbound_connection(
     users: Arc<HashMap<[u8; 32], String>>,
     acceptor: Arc<ServerAcceptor>,
     padding_scheme: PaddingScheme,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let Some(mut stream) = (match acceptor.as_ref() {
         ServerAcceptor::Standard(acceptor) => {
@@ -797,31 +846,38 @@ async fn handle_inbound_connection(
     let padding_len = stream.read_u16().await? as usize;
     let mut padding = vec![0u8; padding_len];
     stream.read_exact(&mut padding).await?;
-    let (mut reader, writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let padding_scheme_for_writer = Arc::new(RwLock::new(padding_scheme.clone()));
+    let writer_cancel = cancel.clone();
     tokio::spawn(async move {
-        let mut writer = writer;
-        let mut packet_index = 1usize;
-        while let Some(frame) = rx.recv().await {
-            if write_padded_frame(
-                &mut writer,
-                frame,
-                &padding_scheme_for_writer,
-                &mut packet_index,
-            )
-            .await
-            .is_err()
-            {
-                break;
-            }
+        tokio::select! {
+            _ = writer_cancel.cancelled() => {}
+            _ = async {
+                let mut packet_index = 1usize;
+                while let Some(frame) = rx.recv().await {
+                    if write_padded_frame(
+                        &mut writer,
+                        frame,
+                        &padding_scheme_for_writer,
+                        &mut packet_index,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            } => {}
         }
     });
-    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, ServerStream>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut settings_received = false;
     loop {
-        let frame = read_frame(&mut reader).await?;
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = read_frame(&mut reader) => result?,
+        };
         match frame.command {
             CMD_SETTINGS => {
                 settings_received = true;
@@ -855,24 +911,42 @@ async fn handle_inbound_connection(
                 let (local, remote) = tokio::io::duplex(DUPLEX_CAPACITY);
                 let (remote_read, remote_write) = tokio::io::split(remote);
                 let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(32);
-                stream_map.insert(frame.stream_id, incoming_tx);
+                let stream_cancel = cancel.child_token();
+                stream_map.insert(
+                    frame.stream_id,
+                    ServerStream {
+                        incoming: incoming_tx,
+                        cancel: stream_cancel.clone(),
+                    },
+                );
                 drop(stream_map);
+                let writer_cancel = stream_cancel.clone();
                 tokio::spawn(async move {
-                    let mut remote_write = remote_write;
-                    while let Some(data) = incoming_rx.recv().await {
-                        if remote_write.write_all(&data).await.is_err() {
-                            break;
-                        }
+                    tokio::select! {
+                        _ = writer_cancel.cancelled() => {}
+                        _ = async {
+                            let mut remote_write = remote_write;
+                            while let Some(data) = incoming_rx.recv().await {
+                                if remote_write.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = remote_write.shutdown().await;
+                        } => {}
                     }
-                    let _ = remote_write.shutdown().await;
                 });
+                let pump_cancel = stream_cancel.clone();
                 let tx_for_pump = tx.clone();
                 let streams_for_pump = Arc::clone(&streams);
                 tokio::spawn(async move {
                     let mut remote_read = remote_read;
                     let mut buffer = vec![0u8; MAX_FRAME_SIZE];
-                    loop {
-                        match remote_read.read(&mut buffer).await {
+                    'read: loop {
+                        let result = tokio::select! {
+                            _ = pump_cancel.cancelled() => break 'read,
+                            result = remote_read.read(&mut buffer) => result,
+                        };
+                        match result {
                             Ok(0) | Err(_) => break,
                             Ok(size) => {
                                 if tx_for_pump
@@ -889,7 +963,9 @@ async fn handle_inbound_connection(
                             }
                         }
                     }
-                    streams_for_pump.lock().await.remove(&frame.stream_id);
+                    if let Some(stream) = streams_for_pump.lock().await.remove(&frame.stream_id) {
+                        stream.cancel.cancel();
+                    }
                     let _ = tx_for_pump
                         .send(Frame {
                             command: CMD_FIN,
@@ -903,21 +979,26 @@ async fn handle_inbound_connection(
                 let tag_for_stream = tag.clone();
                 let user_for_stream = user.clone();
                 let router_for_stream = Arc::clone(&router);
+                let stream_cancel = stream_cancel.clone();
                 tokio::spawn(async move {
-                    let result = handle_server_stream(
-                        local,
-                        frame.stream_id,
-                        source,
-                        tag_for_stream,
-                        user_for_stream,
-                        router_for_stream,
-                        tx_for_stream.clone(),
-                    )
-                    .await;
+                    let result = tokio::select! {
+                        _ = stream_cancel.cancelled() => Ok(()),
+                        result = handle_server_stream(
+                            local,
+                            frame.stream_id,
+                            source,
+                            tag_for_stream,
+                            user_for_stream,
+                            router_for_stream,
+                            tx_for_stream.clone(),
+                        ) => result,
+                    };
                     if let Err(error) = result {
                         tracing::debug!(%error, "AnyTLS stream routing failed");
                     }
-                    streams_for_stream.lock().await.remove(&frame.stream_id);
+                    if let Some(stream) = streams_for_stream.lock().await.remove(&frame.stream_id) {
+                        stream.cancel.cancel();
+                    }
                     let _ = tx_for_stream
                         .send(Frame {
                             command: CMD_FIN,
@@ -928,12 +1009,19 @@ async fn handle_inbound_connection(
                 });
             }
             CMD_PSH => {
-                if let Some(sender) = streams.lock().await.get(&frame.stream_id).cloned() {
+                if let Some(sender) = streams
+                    .lock()
+                    .await
+                    .get(&frame.stream_id)
+                    .map(|stream| stream.incoming.clone())
+                {
                     let _ = sender.send(frame.data).await;
                 }
             }
             CMD_FIN => {
-                streams.lock().await.remove(&frame.stream_id);
+                if let Some(stream) = streams.lock().await.remove(&frame.stream_id) {
+                    stream.cancel.cancel();
+                }
             }
             CMD_HEARTBEAT_REQUEST => {
                 let _ = tx
@@ -949,6 +1037,7 @@ async fn handle_inbound_connection(
             command => anyhow::bail!("unsupported AnyTLS command {command}"),
         }
     }
+    Ok(())
 }
 
 async fn handle_server_stream(
@@ -1090,34 +1179,51 @@ impl ClientSession {
         stream.write_all(&auth).await?;
         let (reader, writer) = tokio::io::split(stream);
         let (tx, rx) = mpsc::channel::<Frame>(64);
-        tokio::spawn(frame_writer(writer, rx, Arc::clone(&padding)));
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        tokio::spawn(frame_writer(
+            writer,
+            rx,
+            Arc::clone(&padding),
+            writer_cancel,
+        ));
         let session = Arc::new(Self {
             tx: tx.clone(),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(1),
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            cancel: cancel.clone(),
+            done: Notify::new(),
             supports_v2: AtomicBool::new(false),
             last_used: Mutex::new(Instant::now()),
             padding: Arc::clone(&padding),
         });
         let reader_session = Arc::clone(&session);
+        let reader_cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Err(error) = client_reader(reader, reader_session.clone()).await {
+            if let Err(error) = client_reader(reader, reader_session.clone(), reader_cancel).await {
                 tracing::debug!(%error, "AnyTLS client session closed");
             }
             reader_session.close();
+            reader_session.clear_streams().await;
+            reader_session.done.notify_waiters();
         });
-        tx.send(Frame {
-            command: CMD_SETTINGS,
-            stream_id: 0,
-            data: format!(
-                "v=2\nclient=sing-box-rs\npadding-md5={}\n",
-                padding.read().await.md5_hex()
-            )
-            .into_bytes(),
-        })
-        .await?;
+        if let Err(error) = tx
+            .send(Frame {
+                command: CMD_SETTINGS,
+                stream_id: 0,
+                data: format!(
+                    "v=2\nclient=sing-box-rs\npadding-md5={}\n",
+                    padding.read().await.md5_hex()
+                )
+                .into_bytes(),
+            })
+            .await
+        {
+            session.close();
+            return Err(error.into());
+        }
         Ok(session)
     }
 
@@ -1136,26 +1242,44 @@ impl ClientSession {
             ClientStream {
                 incoming: incoming_tx,
                 synack: Some(synack_tx),
+                cancel: CancellationToken::new(),
             },
         );
         self.active.fetch_add(1, Ordering::AcqRel);
         *self.last_used.lock().await = Instant::now();
-        let writer_session = Arc::clone(self);
+        let stream_cancel = self
+            .streams
+            .lock()
+            .await
+            .get(&id)
+            .map(|stream| stream.cancel.clone())
+            .expect("inserted AnyTLS stream");
+        let writer_cancel = stream_cancel.clone();
         tokio::spawn(async move {
-            let mut remote_write = remote_write;
-            while let Some(data) = incoming_rx.recv().await {
-                if remote_write.write_all(&data).await.is_err() {
-                    break;
-                }
+            tokio::select! {
+                _ = writer_cancel.cancelled() => {}
+                _ = async {
+                    let mut remote_write = remote_write;
+                    while let Some(data) = incoming_rx.recv().await {
+                        if remote_write.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = remote_write.shutdown().await;
+                } => {}
             }
-            let _ = remote_write.shutdown().await;
         });
+        let pump_cancel = stream_cancel.clone();
         let pump_session = Arc::clone(self);
         tokio::spawn(async move {
             let mut remote_read = remote_read;
             let mut buffer = vec![0u8; MAX_FRAME_SIZE];
-            loop {
-                match remote_read.read(&mut buffer).await {
+            'read: loop {
+                let result = tokio::select! {
+                    _ = pump_cancel.cancelled() => break 'read,
+                    result = remote_read.read(&mut buffer) => result,
+                };
+                match result {
                     Ok(0) | Err(_) => break,
                     Ok(size) => {
                         if pump_session
@@ -1181,45 +1305,77 @@ impl ClientSession {
                     data: Vec::new(),
                 })
                 .await;
-            pump_session.streams.lock().await.remove(&id);
-            pump_session.active.fetch_sub(1, Ordering::AcqRel);
-            *pump_session.last_used.lock().await = Instant::now();
+            pump_session.remove_stream(id).await;
         });
-        self.tx
-            .send(Frame {
-                command: CMD_SYN,
-                stream_id: id,
-                data: Vec::new(),
-            })
-            .await?;
-        let address = encode_socks_address(destination)?;
         let mut local = local;
-        local.write_all(&address).await?;
-        if destination.host == UOT_MAGIC {
-            write_uot_request(&mut local).await?;
-        }
-        if self.supports_v2.load(Ordering::Acquire) {
-            match timeout(STREAM_CONNECT_TIMEOUT, synack_rx).await {
-                Ok(Ok(result)) => result?,
-                Ok(Err(_)) => anyhow::bail!("AnyTLS SYNACK channel closed"),
-                Err(_) => anyhow::bail!("AnyTLS stream connect timed out"),
+        let result = async {
+            self.tx
+                .send(Frame {
+                    command: CMD_SYN,
+                    stream_id: id,
+                    data: Vec::new(),
+                })
+                .await?;
+            let address = encode_socks_address(destination)?;
+            local.write_all(&address).await?;
+            if destination.host == UOT_MAGIC {
+                write_uot_request(&mut local).await?;
             }
+            if self.supports_v2.load(Ordering::Acquire) {
+                match timeout(STREAM_CONNECT_TIMEOUT, synack_rx).await {
+                    Ok(Ok(result)) => result?,
+                    Ok(Err(_)) => anyhow::bail!("AnyTLS SYNACK channel closed"),
+                    Err(_) => anyhow::bail!("AnyTLS stream connect timed out"),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
         }
-        let _ = writer_session;
+        .await;
+        if let Err(error) = result {
+            self.remove_stream(id).await;
+            return Err(error);
+        }
         Ok(local)
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.cancel.cancel();
+    }
+
+    async fn clear_streams(&self) {
+        let streams = self
+            .streams
+            .lock()
+            .await
+            .drain()
+            .map(|(_, stream)| stream)
+            .collect::<Vec<_>>();
+        for stream in streams {
+            stream.cancel.cancel();
+        }
+        self.active.store(0, Ordering::Release);
+    }
+
+    async fn remove_stream(&self, id: u32) {
+        if let Some(stream) = self.streams.lock().await.remove(&id) {
+            stream.cancel.cancel();
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            *self.last_used.lock().await = Instant::now();
+        }
     }
 }
 
 async fn client_reader<R: AsyncRead + Unpin>(
     mut reader: R,
     session: Arc<ClientSession>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     loop {
-        let frame = read_frame(&mut reader).await?;
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = read_frame(&mut reader) => result?,
+        };
         match frame.command {
             CMD_PSH => {
                 if let Some(stream) = session
@@ -1248,7 +1404,7 @@ async fn client_reader<R: AsyncRead + Unpin>(
                 }
             }
             CMD_FIN => {
-                session.streams.lock().await.remove(&frame.stream_id);
+                session.remove_stream(frame.stream_id).await;
             }
             CMD_HEARTBEAT_REQUEST => {
                 let _ = session
@@ -1272,19 +1428,29 @@ async fn client_reader<R: AsyncRead + Unpin>(
             command => anyhow::bail!("unsupported AnyTLS command {command}"),
         }
     }
+    Ok(())
 }
 
 async fn frame_writer<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut rx: mpsc::Receiver<Frame>,
     padding: Arc<RwLock<PaddingScheme>>,
+    cancel: CancellationToken,
 ) {
     let mut packet_index = 1usize;
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => break,
+            frame = rx.recv() => {
+                let Some(frame) = frame else { break; };
+                frame
+            }
+        };
         if write_padded_frame(&mut writer, frame, &padding, &mut packet_index)
             .await
             .is_err()
         {
+            cancel.cancel();
             break;
         }
     }
@@ -1698,7 +1864,7 @@ fn parse_duration(value: &str) -> Result<Duration> {
         total += number * multiplier;
     }
     anyhow::ensure!(total > 0.0, "duration must be positive");
-    Ok(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).context("duration is too large")
 }
 
 fn build_server_config(certificate: &Certificate, tls: &ServerTlsOptions) -> Result<ServerConfig> {
@@ -1875,6 +2041,7 @@ mod tests {
     fn parses_protocol_durations() {
         assert_eq!(parse_duration("2m30s").unwrap(), Duration::from_secs(150));
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert!(parse_duration("999999999999999999999999999s").is_err());
     }
 
     #[test]
@@ -1898,6 +2065,11 @@ mod tests {
         let scheme = PaddingScheme::parse(&options.padding_scheme.source()).unwrap();
         assert_eq!(scheme.stop, 2);
         assert_eq!(scheme.auth_padding_len(), 30);
+    }
+
+    #[test]
+    fn rejects_unbounded_padding_ranges() {
+        assert!(PaddingScheme::parse("0=0-1048577").is_err());
     }
 
     #[test]

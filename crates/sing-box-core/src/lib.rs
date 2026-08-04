@@ -12,6 +12,7 @@ mod registry;
 mod router;
 mod socks;
 mod srs;
+mod tasks;
 
 pub use api::{
     Address, BoxPacketConnection, BoxStream, Certificate, CertificateProvider, Dialer,
@@ -30,6 +31,7 @@ pub use registry::{
     CertificateProviderBuildContext, InboundBuildContext, OutboundBuildContext, Registry,
 };
 pub use router::{Router, RuleSetFetchResult, RuleSetFetcher};
+pub use tasks::ConnectionTasks;
 
 pub fn register_builtins(registry: &mut Registry) -> anyhow::Result<()> {
     block::register(registry)?;

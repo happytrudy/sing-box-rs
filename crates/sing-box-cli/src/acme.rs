@@ -906,7 +906,7 @@ fn parse_duration(value: &str) -> Result<Duration> {
         remaining = &remaining[unit_end..];
     }
     anyhow::ensure!(seconds.is_finite() && seconds >= 0.0, "invalid duration");
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).context("duration is too large")
 }
 
 async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {

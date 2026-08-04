@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sing_box_core::{
-    Address, Inbound, InboundBuildContext, Lifecycle, Network, Registry, Router, Session,
-    bind_tcp_listeners,
+    Address, ConnectionTasks, Inbound, InboundBuildContext, Lifecycle, Network, Registry, Router,
+    Session, bind_tcp_listeners,
 };
 use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
@@ -80,6 +80,7 @@ fn default_listen() -> String {
 struct Running {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
+    connection_tasks: ConnectionTasks,
 }
 
 struct VlessInbound {
@@ -110,11 +111,14 @@ impl Lifecycle for VlessInbound {
         let local_addr = listeners[0].local_addr()?;
         *self.local_addr.write().expect("VLESS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
+        let connection_tasks = ConnectionTasks::new();
         let mut tasks = Vec::with_capacity(listeners.len());
         for listener in listeners {
+            let connection_tasks_for_listener = connection_tasks.clone();
             tasks.push(tokio::spawn(run_listener(
                 listener,
                 cancel.clone(),
+                connection_tasks_for_listener,
                 Arc::clone(&self.router),
                 self.tag.clone(),
                 self.path.clone(),
@@ -123,7 +127,11 @@ impl Lifecycle for VlessInbound {
                 self.reality.clone(),
             )));
         }
-        *self.running.lock().await = Some(Running { cancel, tasks });
+        *self.running.lock().await = Some(Running {
+            cancel,
+            tasks,
+            connection_tasks,
+        });
         tracing::info!(tag = %self.tag, %local_addr, "started VLESS WebSocket inbound");
         Ok(())
     }
@@ -134,6 +142,7 @@ impl Lifecycle for VlessInbound {
             for task in running.tasks {
                 task.await?;
             }
+            running.connection_tasks.join().await;
         }
         Ok(())
     }
@@ -219,6 +228,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
 async fn run_listener(
     listener: TcpListener,
     cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
     router: Arc<Router>,
     tag: String,
     path: String,
@@ -237,20 +247,24 @@ async fn run_listener(
                     let path = path.clone();
                     let early_data_header_name = early_data_header_name.clone();
                     let reality = reality.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = handle_connection(
-                            stream,
-                            source,
-                            router,
-                            tag,
-                            path,
-                            early_data_header_name,
-                            users,
-                            reality,
-                        )
-                        .await
-                        {
-                            tracing::debug!(%source, %error, "VLESS WebSocket connection closed");
+                    let connection_cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
+                        tokio::select! {
+                            _ = connection_cancel.cancelled() => {}
+                            result = handle_connection(
+                                stream,
+                                source,
+                                router,
+                                tag,
+                                path,
+                                early_data_header_name,
+                                users,
+                                reality,
+                            ) => {
+                                if let Err(error) = result {
+                                    tracing::debug!(%source, %error, "VLESS WebSocket connection closed");
+                                }
+                            }
                         }
                     });
                 }
