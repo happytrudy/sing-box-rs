@@ -1,5 +1,6 @@
 mod api;
 mod block;
+mod buffer;
 mod certificate;
 mod config;
 mod direct;

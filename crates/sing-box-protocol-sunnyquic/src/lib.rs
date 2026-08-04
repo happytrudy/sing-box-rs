@@ -504,14 +504,13 @@ struct SunnyQuicPacketAdapter {
 
 #[async_trait]
 impl PacketConnection for SunnyQuicPacketAdapter {
-    async fn send(&self, packet: Packet) -> Result<()> {
+    async fn send(&self, mut packet: Packet) -> Result<()> {
+        let destination =
+            sing_quic::Address::new(packet.destination.host.clone(), packet.destination.port)?;
         self.inner
             .send(ShadowQuicPacket {
-                data: packet.data,
-                destination: sing_quic::Address::new(
-                    packet.destination.host,
-                    packet.destination.port,
-                )?,
+                data: packet.take_data(),
+                destination,
             })
             .await?;
         Ok(())
@@ -519,10 +518,8 @@ impl PacketConnection for SunnyQuicPacketAdapter {
 
     async fn recv(&self) -> Result<Packet> {
         let packet = self.inner.recv().await?;
-        Ok(Packet {
-            data: packet.data,
-            destination: Address::new(packet.destination.host(), packet.destination.port())?,
-        })
+        let destination = Address::new(packet.destination.host(), packet.destination.port())?;
+        Ok(Packet::new(packet.data, destination))
     }
 }
 

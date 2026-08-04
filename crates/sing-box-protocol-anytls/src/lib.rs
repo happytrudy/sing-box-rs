@@ -1637,7 +1637,7 @@ where
         anyhow::ensure!(length <= UOT_MAX_PACKET, "AnyTLS UDP packet is too large");
         let mut data = vec![0u8; length];
         reader.read_exact(&mut data).await?;
-        Ok(Packet { data, destination })
+        Ok(Packet::new(data, destination))
     }
 }
 
@@ -2214,10 +2214,7 @@ mod tests {
         let (reader, writer) = tokio::io::split(left);
         let connection = UotPacketConnection::new(reader, writer);
         let (mut peer_reader, mut peer_writer) = tokio::io::split(right);
-        let outbound = Packet {
-            data: b"hello".to_vec(),
-            destination: Address::new("example.com", 443).unwrap(),
-        };
+        let outbound = Packet::new(b"hello".to_vec(), Address::new("example.com", 443).unwrap());
         let send = connection.send(outbound.clone());
         let read = async {
             let packet = read_uot_address(&mut peer_reader).await.unwrap();

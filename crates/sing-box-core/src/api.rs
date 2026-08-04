@@ -13,7 +13,7 @@ use tokio::{
     sync::watch,
 };
 
-use crate::DomainStrategy;
+use crate::{DomainStrategy, buffer::PacketBufferPool};
 
 pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -21,10 +21,70 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn ProxyStream>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Packet {
     pub data: Vec<u8>,
     pub destination: Address,
+    recycle_pool: Option<PacketBufferPool>,
+}
+
+impl Packet {
+    pub fn new(data: Vec<u8>, destination: Address) -> Self {
+        Self {
+            data,
+            destination,
+            recycle_pool: None,
+        }
+    }
+
+    pub(crate) fn from_pool(
+        mut data: Vec<u8>,
+        length: usize,
+        destination: Address,
+        recycle_pool: PacketBufferPool,
+    ) -> Self {
+        data.truncate(length);
+        Self {
+            data,
+            destination,
+            recycle_pool: Some(recycle_pool),
+        }
+    }
+
+    pub fn take_data(&mut self) -> Vec<u8> {
+        self.recycle_pool = None;
+        std::mem::take(&mut self.data)
+    }
+}
+
+impl Clone for Packet {
+    fn clone(&self) -> Self {
+        Self::new(self.data.clone(), self.destination.clone())
+    }
+}
+
+impl fmt::Debug for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Packet")
+            .field("data", &self.data)
+            .field("destination", &self.destination)
+            .finish()
+    }
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.destination == other.destination
+    }
+}
+
+impl Eq for Packet {}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        if let Some(pool) = self.recycle_pool.take() {
+            pool.recycle(std::mem::take(&mut self.data));
+        }
+    }
 }
 
 #[async_trait]

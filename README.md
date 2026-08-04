@@ -75,8 +75,6 @@ validation.
 
 ### Performance and lifecycle
 
-- [ ] Replace the remaining per-packet payload `Vec` allocation in Direct and
-  SOCKS with an ownership-aware packet buffer pool.
 - [ ] Add per-stream task accounting and metrics inside the lower-level QUIC
   protocol implementations; connection-level cancellation is implemented.
 - [ ] Add sustained throughput and memory-boundary benchmarks for Brutal,

@@ -293,10 +293,10 @@ struct QuicPacketConnection {
 
 #[async_trait]
 impl PacketConnection for QuicPacketConnection {
-    async fn send(&self, packet: Packet) -> Result<()> {
+    async fn send(&self, mut packet: Packet) -> Result<()> {
         mark_activity(&self.last_activity);
         self.outgoing
-            .send((self.request_id, packet.data))
+            .send((self.request_id, packet.take_data()))
             .await
             .context("queue Cloudflare QUIC datagram")?;
         Ok(())
@@ -309,10 +309,7 @@ impl PacketConnection for QuicPacketConnection {
             .await
             .context("Cloudflare QUIC UDP flow closed")?;
         mark_activity(&self.last_activity);
-        Ok(Packet {
-            data,
-            destination: self.destination.clone(),
-        })
+        Ok(Packet::new(data, self.destination.clone()))
     }
 }
 

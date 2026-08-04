@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Address, ConnectionTasks, Inbound, InboundBuildContext, Lifecycle, Network, Packet,
     PacketConnection, Registry, Router, Session, StartStage, bind_tcp_listeners,
+    buffer::{PacketBufferPool, shared_packet_buffer_pool},
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,7 +225,7 @@ async fn handle_udp_associate(
         socket,
         control_source_ip: source.ip(),
         peer: Mutex::new(None),
-        buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
+        buffer_pool: shared_packet_buffer_pool(),
     });
     let session = Session::inbound(Network::Udp, source, destination, tag, "socks", None);
 
@@ -242,7 +243,7 @@ struct SocksPacketConnection {
     socket: Arc<UdpSocket>,
     control_source_ip: IpAddr,
     peer: Mutex<Option<SocketAddr>>,
-    buffer: Mutex<Vec<u8>>,
+    buffer_pool: PacketBufferPool,
 }
 
 #[async_trait]
@@ -261,9 +262,9 @@ impl PacketConnection for SocksPacketConnection {
     }
 
     async fn recv(&self) -> Result<Packet> {
-        let mut buffer = self.buffer.lock().await;
+        let mut buffer = self.buffer_pool.acquire();
         loop {
-            let (length, source) = self.socket.recv_from(&mut buffer).await?;
+            let (length, source) = self.socket.recv_from(buffer.as_mut_slice()).await?;
             if source.ip() != self.control_source_ip {
                 continue;
             }
@@ -272,14 +273,25 @@ impl PacketConnection for SocksPacketConnection {
                 continue;
             }
             anyhow::ensure!(length >= 4, "truncated SOCKS UDP datagram");
-            anyhow::ensure!(buffer[0..2] == [0, 0], "invalid SOCKS UDP reserved bytes");
-            anyhow::ensure!(buffer[2] == 0, "fragmented SOCKS UDP is not supported");
-            let (destination, consumed) = decode_address(&buffer[3..length])?;
+            anyhow::ensure!(
+                buffer.as_mut_slice()[0..2] == [0, 0],
+                "invalid SOCKS UDP reserved bytes"
+            );
+            anyhow::ensure!(
+                buffer.as_mut_slice()[2] == 0,
+                "fragmented SOCKS UDP is not supported"
+            );
+            let (destination, consumed) = decode_address(&buffer.as_mut_slice()[3..length])?;
             *self.peer.lock().await = Some(source);
-            return Ok(Packet {
-                data: buffer[3 + consumed..length].to_vec(),
+            let payload_start = 3 + consumed;
+            let payload_length = length - payload_start;
+            buffer.as_mut_slice().copy_within(payload_start..length, 0);
+            return Ok(Packet::from_pool(
+                buffer.into_vec(),
+                payload_length,
                 destination,
-            });
+                self.buffer_pool.clone(),
+            ));
         }
     }
 }
@@ -377,18 +389,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn udp_receive_reuses_the_socket_buffer() {
+    async fn udp_receive_returns_the_buffer_to_the_shared_pool() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = Address::new("example.com", 443).unwrap();
         let mut encoded = vec![0, 0, 0];
         encode_address(&destination, &mut encoded).unwrap();
         encoded.extend_from_slice(b"packet");
+        let buffer_pool = PacketBufferPool::new();
         let connection = SocksPacketConnection {
             socket: Arc::clone(&socket),
             control_source_ip: peer.local_addr().unwrap().ip(),
             peer: Mutex::new(None),
-            buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
+            buffer_pool: buffer_pool.clone(),
         };
 
         peer.send_to(&encoded, socket.local_addr().unwrap())
@@ -396,6 +409,8 @@ mod tests {
             .unwrap();
         let packet = connection.recv().await.unwrap();
         assert_eq!(packet.data, b"packet");
-        assert_eq!(connection.buffer.lock().await.capacity(), u16::MAX as usize);
+        assert_eq!(buffer_pool.available(), 0);
+        drop(packet);
+        assert_eq!(buffer_pool.available(), 1);
     }
 }

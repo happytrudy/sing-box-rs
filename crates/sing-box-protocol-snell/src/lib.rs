@@ -130,22 +130,17 @@ struct SnellPacketConnection {
 
 #[async_trait]
 impl PacketConnection for SnellPacketConnection {
-    async fn send(&self, packet: Packet) -> Result<()> {
-        self.inner
-            .send(
-                packet.data,
-                SnellAddress::new(packet.destination.host, packet.destination.port)?,
-            )
-            .await?;
+    async fn send(&self, mut packet: Packet) -> Result<()> {
+        let destination =
+            SnellAddress::new(packet.destination.host.clone(), packet.destination.port)?;
+        self.inner.send(packet.take_data(), destination).await?;
         Ok(())
     }
 
     async fn recv(&self) -> Result<Packet> {
         let packet = self.inner.recv().await?;
-        Ok(Packet {
-            data: packet.data,
-            destination: Address::new(packet.destination.host(), packet.destination.port())?,
-        })
+        let destination = Address::new(packet.destination.host(), packet.destination.port())?;
+        Ok(Packet::new(packet.data, destination))
     }
 }
 
