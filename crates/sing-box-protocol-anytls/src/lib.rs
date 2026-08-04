@@ -2137,6 +2137,38 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn client_session_close_cancels_reader() {
+        let (reader, _peer) = tokio::io::duplex(1024);
+        let (tx, _rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let session = Arc::new(ClientSession {
+            tx,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            next_stream_id: AtomicU32::new(1),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            cancel: cancel.clone(),
+            done: Notify::new(),
+            supports_v2: AtomicBool::new(false),
+            last_used: Mutex::new(Instant::now()),
+            padding: Arc::new(RwLock::new(PaddingScheme::parse("").unwrap())),
+        });
+        let reader_session = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = client_reader(reader, reader_session.clone(), cancel).await;
+            reader_session.close();
+            reader_session.clear_streams().await;
+            reader_session.done.notify_one();
+        });
+
+        let done = session.done.notified();
+        session.close();
+        timeout(Duration::from_secs(1), done)
+            .await
+            .expect("AnyTLS reader did not stop after session close");
+    }
+
     #[test]
     fn md5_matches_standard_vector() {
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");

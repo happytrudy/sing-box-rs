@@ -134,3 +134,31 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DomainStrategy;
+
+    #[tokio::test]
+    async fn recv_reuses_the_large_socket_buffer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = socket.local_addr().unwrap();
+        let connection = DirectPacketConnection {
+            ipv4: socket,
+            ipv6: None,
+            ipv4_buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
+            ipv6_buffer: None,
+            dialer: SystemDialer::new(None, None, DomainStrategy::AsIs),
+        };
+
+        peer.send_to(b"packet", destination).await.unwrap();
+        let packet = connection.recv().await.unwrap();
+        assert_eq!(packet.data, b"packet");
+        assert_eq!(
+            connection.ipv4_buffer.lock().await.capacity(),
+            u16::MAX as usize
+        );
+    }
+}

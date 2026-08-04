@@ -371,3 +371,31 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn udp_receive_reuses_the_socket_buffer() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = Address::new("example.com", 443).unwrap();
+        let mut encoded = vec![0, 0, 0];
+        encode_address(&destination, &mut encoded).unwrap();
+        encoded.extend_from_slice(b"packet");
+        let connection = SocksPacketConnection {
+            socket: Arc::clone(&socket),
+            control_source_ip: peer.local_addr().unwrap().ip(),
+            peer: Mutex::new(None),
+            buffer: Mutex::new(vec![0u8; u16::MAX as usize]),
+        };
+
+        peer.send_to(&encoded, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let packet = connection.recv().await.unwrap();
+        assert_eq!(packet.data, b"packet");
+        assert_eq!(connection.buffer.lock().await.capacity(), u16::MAX as usize);
+    }
+}

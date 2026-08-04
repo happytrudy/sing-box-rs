@@ -51,6 +51,45 @@ not the upstream protocol's theoretical capabilities.
 Core endpoints outside this transport matrix are the SOCKS5 TCP/UDP inbound and
 the Direct and Block TCP/UDP outbounds.
 
+## TODO
+
+The following items are intentionally tracked separately from the working
+feature set. A checked item is not implied by the transport matrix above; each
+item still needs implementation, compatibility work, or long-running
+validation.
+
+### Protocol and official compatibility
+
+- [ ] Add Hysteria2 outbound UDP and the complete official network selection
+  behavior.
+- [ ] Add Hysteria2 server-port hopping, obfs, realm, and the complete BBR
+  profile set.
+- [ ] Align Hysteria2 outbound TLS with sing-box, including system roots,
+  `insecure`, ALPN, certificate pinning, and optional certificate providers.
+- [ ] Add VLESS outbound support and additional transports; the current VLESS
+  adapter is WebSocket inbound TCP only.
+- [ ] Add ShadowQUIC outbound UDP using the existing QUIC packet-association
+  API.
+- [ ] Compare Cloudflared HTTP/2 and QUIC framing against the latest upstream
+  implementation and add any missing outbound or datagram variants.
+
+### Performance and lifecycle
+
+- [ ] Replace the remaining per-packet payload `Vec` allocation in Direct and
+  SOCKS with an ownership-aware packet buffer pool.
+- [ ] Add per-stream task accounting and metrics inside the lower-level QUIC
+  protocol implementations; connection-level cancellation is implemented.
+- [ ] Add sustained throughput and memory-boundary benchmarks for Brutal,
+  BBR, AnyTLS multiplexing, and UDP-over-TCP.
+
+### Validation
+
+- [ ] Add long-running tests with repeated connect, cancel, restart, and
+  simultaneous IPv4/IPv6 traffic.
+- [ ] Add high-concurrency proxy tests covering repeated speed-test-style
+  cancellation and reconnection without restarting the client.
+- [ ] Add rule-set hot-reload tests while TCP and UDP sessions are active.
+
 ## Project layout
 
 ```text
