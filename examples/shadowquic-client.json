@@ -12,6 +12,8 @@
       "keep_alive_period": "10s",
       "idle_timeout": "30s",
       "disable_path_mtu_discovery": false,
+      "datagram_receive_buffer_size": 1048576,
+      "datagram_send_buffer_size": 1048576,
       "username": "demo",
       "password": "replace-with-a-long-password",
       "server_name": "camouflage.example.com",

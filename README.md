@@ -338,9 +338,11 @@ measured send/receive Mbps every two seconds for each active QUIC connection.
 The inbound and outbound also accept the sing-box QUIC transport fields
 `idle_timeout`, `keep_alive_period`, `stream_receive_window`,
 `connection_receive_window`, `max_concurrent_streams`, `initial_packet_size`,
-and `disable_path_mtu_discovery`. These map directly to Quinn's public
-`TransportConfig` methods. The default incoming stream limit remains the
-official Hysteria2 value; `max_concurrent_streams` only changes it when set.
+`disable_path_mtu_discovery`, `datagram_receive_buffer_size`, and
+`datagram_send_buffer_size`. These map directly to Quinn's public
+`TransportConfig` methods. Datagram buffers default to 1 MiB per direction and
+are limited to 8 MiB per direction. The default incoming stream limit remains
+the official Hysteria2 value; `max_concurrent_streams` only changes it when set.
 
 AnyTLS uses the sing-box protocol shape: the inbound accepts `users` and TLS
 certificate files or a shared `certificate_provider` tag; the outbound accepts

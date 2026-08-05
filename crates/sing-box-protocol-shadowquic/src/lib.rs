@@ -57,6 +57,10 @@ struct ShadowQuicQuicOptions {
     idle_timeout: String,
     #[serde(default)]
     disable_path_mtu_discovery: bool,
+    #[serde(default = "default_datagram_buffer_size")]
+    datagram_receive_buffer_size: usize,
+    #[serde(default = "default_datagram_buffer_size")]
+    datagram_send_buffer_size: usize,
 }
 
 impl ShadowQuicQuicOptions {
@@ -69,6 +73,8 @@ impl ShadowQuicQuicOptions {
             keep_alive_period: parse_optional_duration(&self.keep_alive_period)?,
             idle_timeout: parse_optional_duration(&self.idle_timeout)?,
             disable_path_mtu_discovery: self.disable_path_mtu_discovery,
+            datagram_receive_buffer_size: self.datagram_receive_buffer_size,
+            datagram_send_buffer_size: self.datagram_send_buffer_size,
         })
     }
 }
@@ -87,6 +93,9 @@ fn default_stream_receive_window() -> u64 {
 }
 fn default_idle_timeout() -> String {
     "30s".into()
+}
+fn default_datagram_buffer_size() -> usize {
+    1024 * 1024
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -622,6 +631,8 @@ mod tests {
                 "keep_alive_period": "5s",
                 "idle_timeout": "45s",
                 "disable_path_mtu_discovery": true,
+                "datagram_receive_buffer_size": 1048576,
+                "datagram_send_buffer_size": 2097152,
                 "users": [{"name": "demo", "password": "secret"}]
             }"#,
         )
@@ -632,5 +643,7 @@ mod tests {
         assert_eq!(transport.keep_alive_period, Some(Duration::from_secs(5)));
         assert_eq!(transport.idle_timeout, Some(Duration::from_secs(45)));
         assert!(transport.disable_path_mtu_discovery);
+        assert_eq!(transport.datagram_receive_buffer_size, 1_048_576);
+        assert_eq!(transport.datagram_send_buffer_size, 2_097_152);
     }
 }
