@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    io::Cursor,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, RwLock},
@@ -9,10 +10,16 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use serde::Deserialize;
 use sing_box_core::{
-    Address, ConnectionTasks, Inbound, InboundBuildContext, Lifecycle, Network, Registry, Router,
-    Session, bind_tcp_listeners,
+    Address, ConnectionTasks, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Registry,
+    Router, Session, bind_tcp_listeners,
 };
 use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
@@ -21,6 +28,7 @@ use tokio::{
     sync::Mutex,
     task::JoinHandle,
 };
+use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
 const VLESS_VERSION: u8 = 0;
@@ -73,6 +81,51 @@ struct WebSocketOptions {
     early_data_header_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VlessOutboundOptions {
+    server: String,
+    #[serde(default = "default_vless_server_port")]
+    server_port: u16,
+    uuid: String,
+    transport: WebSocketOutboundOptions,
+    #[serde(default)]
+    tls: VlessClientTlsOptions,
+}
+
+fn default_vless_server_port() -> u16 {
+    443
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSocketOutboundOptions {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    max_early_data: usize,
+    #[serde(default)]
+    early_data_header_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct VlessClientTlsOptions {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    server_name: String,
+    #[serde(default)]
+    insecure: bool,
+    #[serde(default)]
+    certificate_path: String,
+    #[serde(default)]
+    alpn: Vec<String>,
+}
+
 fn default_listen() -> String {
     "127.0.0.1".to_owned()
 }
@@ -94,6 +147,19 @@ struct VlessInbound {
     running: Mutex<Option<Running>>,
     local_addr: RwLock<Option<SocketAddr>>,
     reality: Option<Arc<RealityAcceptor>>,
+}
+
+struct VlessOutbound {
+    tag: String,
+    server: String,
+    server_port: u16,
+    uuid: [u8; 16],
+    path: String,
+    headers: HashMap<String, String>,
+    max_early_data: usize,
+    early_data_header_name: String,
+    tls: VlessClientTlsOptions,
+    dialer: sing_box_core::SystemDialer,
 }
 
 #[async_trait]
@@ -162,7 +228,142 @@ impl Inbound for VlessInbound {
     }
 }
 
+impl Lifecycle for VlessOutbound {}
+
+#[async_trait]
+impl Dialer for VlessOutbound {
+    async fn connect(&self, session: &Session) -> Result<sing_box_core::BoxStream> {
+        anyhow::ensure!(
+            session.network == Network::Tcp,
+            "VLESS outbound only supports TCP"
+        );
+        let server = Address::new(self.server.clone(), self.server_port)?;
+        let transport = self.dialer.connect(&Session::outbound(server)).await?;
+        let stream = if self.tls.enabled {
+            let config = build_vless_client_config(&self.tls).await?;
+            let connector = TlsConnector::from(Arc::new(config));
+            let server_name = if self.tls.server_name.is_empty() {
+                self.server.clone()
+            } else {
+                self.tls.server_name.clone()
+            };
+            let server_name =
+                ServerName::try_from(server_name).context("invalid VLESS server_name")?;
+            Box::new(
+                connector
+                    .connect(server_name, transport)
+                    .await
+                    .context("VLESS TLS handshake")?,
+            ) as sing_box_core::BoxStream
+        } else {
+            transport
+        };
+        let request = encode_vless_request(&self.uuid, &session.destination)?;
+        let early_data = self.max_early_data > 0
+            && !self.early_data_header_name.is_empty()
+            && request.len() <= self.max_early_data;
+        let key = websocket_key()?;
+        let path = if self.path.starts_with('/') {
+            self.path.clone()
+        } else {
+            format!("/{}", self.path)
+        };
+        let host = if self.tls.server_name.is_empty() {
+            self.server.as_str()
+        } else {
+            self.tls.server_name.as_str()
+        };
+        let mut http = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n"
+        );
+        for (name, value) in &self.headers {
+            if !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "host" | "upgrade" | "connection" | "sec-websocket-version" | "sec-websocket-key"
+            ) {
+                http.push_str(name);
+                http.push_str(": ");
+                http.push_str(value);
+                http.push_str("\r\n");
+            }
+        }
+        if early_data {
+            http.push_str(&self.early_data_header_name);
+            http.push_str(": ");
+            http.push_str(&encode_base64_url(&request));
+            http.push_str("\r\n");
+        }
+        http.push_str("\r\n");
+        let mut stream = stream;
+        stream.write_all(http.as_bytes()).await?;
+        stream.flush().await?;
+        let response = read_http_response(&mut stream).await?;
+        anyhow::ensure!(
+            response.status == 101,
+            "VLESS WebSocket server returned HTTP status {}",
+            response.status
+        );
+        anyhow::ensure!(
+            response
+                .headers
+                .get("sec-websocket-accept")
+                .is_some_and(|value| value == &websocket_accept(&key)),
+            "invalid VLESS WebSocket accept header"
+        );
+        let mut stream = WebSocketStream::new(stream, response.tail, Vec::new(), true);
+        if !early_data {
+            stream.write_all(&request).await?;
+            stream.flush().await?;
+        }
+        let mut response = [0u8; 2];
+        stream.read_exact(&mut response).await?;
+        anyhow::ensure!(response == [VLESS_VERSION, 0], "invalid VLESS response");
+        Ok(Box::new(stream))
+    }
+}
+
+impl sing_box_core::Outbound for VlessOutbound {
+    fn kind(&self) -> &'static str {
+        "vless"
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
 pub fn register(registry: &mut Registry) -> Result<()> {
+    registry.register_outbound::<VlessOutboundOptions, _, _>(
+        "vless",
+        |context: sing_box_core::OutboundBuildContext, tag, options| async move {
+            anyhow::ensure!(!options.server.is_empty(), "VLESS server cannot be empty");
+            anyhow::ensure!(options.server_port != 0, "VLESS server_port cannot be zero");
+            anyhow::ensure!(
+                options.transport.kind == "ws",
+                "VLESS only supports WebSocket transport"
+            );
+            anyhow::ensure!(
+                !options.transport.path.is_empty(),
+                "VLESS WebSocket path cannot be empty"
+            );
+            anyhow::ensure!(
+                options.tls.alpn.len() <= 16,
+                "VLESS TLS ALPN list is too large"
+            );
+            Ok(Arc::new(VlessOutbound {
+                tag,
+                server: options.server,
+                server_port: options.server_port,
+                uuid: parse_uuid(&options.uuid).context("parse VLESS outbound UUID")?,
+                path: options.transport.path,
+                headers: options.transport.headers,
+                max_early_data: options.transport.max_early_data,
+                early_data_header_name: options.transport.early_data_header_name,
+                tls: options.tls,
+                dialer: context.system_dialer,
+            }) as Arc<dyn sing_box_core::Outbound>)
+        },
+    )?;
     registry.register_inbound::<VlessInboundOptions, _, _>(
         "vless",
         |context: InboundBuildContext, tag, options| async move {
@@ -363,7 +564,7 @@ where
         .await?;
     stream.flush().await?;
 
-    let mut application = WebSocketStream::new(stream, request.tail, early_data);
+    let mut application = WebSocketStream::new(stream, request.tail, early_data, false);
     let (destination, user) = read_vless_request(&mut application, &users).await?;
     application.write_all(&[VLESS_VERSION, 0]).await?;
     let session = Session::inbound(Network::Tcp, source, destination, tag, "vless", Some(user));
@@ -383,6 +584,53 @@ impl HttpRequest {
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
     }
+}
+
+struct HttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    tail: Vec<u8>,
+}
+
+async fn read_http_response<S>(stream: &mut S) -> Result<HttpResponse>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut data = Vec::with_capacity(1024);
+    let header_end = loop {
+        if data.len() > MAX_HTTP_HEADER_SIZE {
+            anyhow::bail!("VLESS WebSocket response headers are too large");
+        }
+        let mut chunk = [0u8; 1024];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            anyhow::bail!("VLESS WebSocket server closed before response headers");
+        }
+        data.extend_from_slice(&chunk[..read]);
+        if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let header_text = std::str::from_utf8(&data[..header_end - 4])?;
+    let mut lines = header_text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("VLESS WebSocket response has no status code")?
+        .parse::<u16>()
+        .context("parse VLESS WebSocket response status")?;
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            anyhow::bail!("invalid VLESS WebSocket response header");
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+    }
+    Ok(HttpResponse {
+        status,
+        headers,
+        tail: data[header_end..].to_vec(),
+    })
 }
 
 async fn read_http_request<S>(stream: &mut S) -> Result<HttpRequest>
@@ -468,6 +716,7 @@ struct WebSocketReadFrame {
 
 struct WebSocketStream<S> {
     inner: S,
+    client_side: bool,
     input: Vec<u8>,
     input_offset: usize,
     early_data: Vec<u8>,
@@ -483,9 +732,10 @@ struct WebSocketStream<S> {
 }
 
 impl<S> WebSocketStream<S> {
-    fn new(inner: S, input: Vec<u8>, early_data: Vec<u8>) -> Self {
+    fn new(inner: S, input: Vec<u8>, early_data: Vec<u8>, client_side: bool) -> Self {
         Self {
             inner,
+            client_side,
             input,
             input_offset: 0,
             early_data,
@@ -525,18 +775,19 @@ impl<S> WebSocketStream<S> {
             return Err(invalid_websocket_data("WebSocket reserved bits are set"));
         }
         let opcode = input[0] & 0x0f;
-        if input[1] & 0x80 == 0 {
-            return Err(invalid_websocket_data(
-                "client WebSocket frame is not masked",
-            ));
-        }
         let length_tag = input[1] & 0x7f;
         let extended_length = match length_tag {
             126 => 2,
             127 => 8,
             _ => 0,
         };
-        let header_length = 2 + extended_length + 4;
+        let masked = input[1] & 0x80 != 0;
+        if masked == self.client_side {
+            return Err(invalid_websocket_data(
+                "invalid WebSocket masking direction",
+            ));
+        }
+        let header_length = 2 + extended_length + usize::from(masked) * 4;
         if input.len() < header_length {
             return Ok(false);
         }
@@ -553,9 +804,13 @@ impl<S> WebSocketStream<S> {
             return Err(invalid_websocket_data("invalid WebSocket control frame"));
         }
         let mask_offset = 2 + extended_length;
-        let mask = input[mask_offset..mask_offset + 4]
-            .try_into()
-            .expect("WebSocket mask");
+        let mask = if masked {
+            input[mask_offset..mask_offset + 4]
+                .try_into()
+                .expect("WebSocket mask")
+        } else {
+            [0; 4]
+        };
         match opcode {
             0x0 => {
                 if !self.fragmented {
@@ -589,43 +844,60 @@ impl<S> WebSocketStream<S> {
         Ok(true)
     }
 
-    fn append_frame(&mut self, opcode: u8, payload: &[u8]) {
+    fn append_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         if self.write_offset == self.write_buffer.len() {
             self.write_buffer.clear();
             self.write_offset = 0;
         }
         self.write_buffer.push(0x80 | opcode);
+        let mask_bit = if self.client_side { 0x80 } else { 0 };
         match payload.len() {
-            0..=125 => self.write_buffer.push(payload.len() as u8),
+            0..=125 => self.write_buffer.push(mask_bit | payload.len() as u8),
             126..=65_535 => {
-                self.write_buffer.push(126);
+                self.write_buffer.push(mask_bit | 126);
                 self.write_buffer
                     .extend_from_slice(&(payload.len() as u16).to_be_bytes());
             }
             length => {
-                self.write_buffer.push(127);
+                self.write_buffer.push(mask_bit | 127);
                 self.write_buffer
                     .extend_from_slice(&(length as u64).to_be_bytes());
             }
         }
-        self.write_buffer.extend_from_slice(payload);
+        if self.client_side {
+            let mut mask = [0u8; 4];
+            SystemRandom::new()
+                .fill(&mut mask)
+                .map_err(|_| io::Error::other("generate WebSocket mask"))?;
+            self.write_buffer.extend_from_slice(&mask);
+            self.write_buffer.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[index % 4]),
+            );
+        } else {
+            self.write_buffer.extend_from_slice(payload);
+        }
+        Ok(())
     }
 
-    fn finish_read_frame(&mut self) {
+    fn finish_read_frame(&mut self) -> io::Result<()> {
         let frame = self.read_frame.take().expect("WebSocket read frame");
         match frame.opcode {
             0x8 => {
-                self.append_frame(0x8, frame.control_payload.as_deref().unwrap_or_default());
+                self.append_frame(0x8, frame.control_payload.as_deref().unwrap_or_default())?;
                 self.control_write_pending = true;
                 self.close_queued = true;
                 self.read_closed = true;
             }
             0x9 => {
-                self.append_frame(0xA, frame.control_payload.as_deref().unwrap_or_default());
+                self.append_frame(0xA, frame.control_payload.as_deref().unwrap_or_default())?;
                 self.control_write_pending = true;
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -722,7 +994,7 @@ where
                 .as_ref()
                 .is_some_and(|frame| frame.remaining == 0)
             {
-                this.finish_read_frame();
+                this.finish_read_frame()?;
                 continue;
             }
             if this.available_input().is_empty() {
@@ -810,7 +1082,7 @@ where
             Poll::Pending => return Poll::Pending,
         }
         let accepted = data.len().min(MAX_WS_FRAME_SIZE as usize);
-        this.append_frame(0x2, &data[..accepted]);
+        this.append_frame(0x2, &data[..accepted])?;
         this.pending_payload_len = Some(accepted);
         match this.poll_flush_output(context) {
             Poll::Ready(Ok(())) => {
@@ -833,7 +1105,9 @@ where
     fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if !this.close_queued {
-            this.append_frame(0x8, &[]);
+            if let Err(error) = this.append_frame(0x8, &[]) {
+                return Poll::Ready(Err(error));
+            }
             this.close_queued = true;
         }
         match this.poll_flush_output(context) {
@@ -922,6 +1196,43 @@ fn parse_uuid(value: &str) -> Result<[u8; 16]> {
     Ok(output)
 }
 
+fn encode_vless_request(uuid: &[u8; 16], destination: &Address) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(64 + destination.host.len());
+    output.push(VLESS_VERSION);
+    output.extend_from_slice(uuid);
+    output.push(0);
+    output.push(VLESS_COMMAND_TCP);
+    output.extend_from_slice(&destination.port.to_be_bytes());
+    match destination.host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => {
+            output.push(1);
+            output.extend_from_slice(&address.octets());
+        }
+        Ok(std::net::IpAddr::V6(address)) => {
+            output.push(3);
+            output.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            anyhow::ensure!(
+                destination.host.len() <= u8::MAX as usize,
+                "VLESS domain is too long"
+            );
+            output.push(2);
+            output.push(destination.host.len() as u8);
+            output.extend_from_slice(destination.host.as_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn websocket_key() -> Result<String> {
+    let mut key = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| anyhow::anyhow!("generate WebSocket key"))?;
+    Ok(encode_base64(&key))
+}
+
 fn hex_value(value: u8) -> Result<u8> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
@@ -992,6 +1303,13 @@ fn encode_base64(value: &[u8]) -> String {
     output
 }
 
+fn encode_base64_url(value: &[u8]) -> String {
+    encode_base64(value)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
 fn sha1(message: &[u8]) -> [u8; 20] {
     let bit_length = (message.len() as u64) * 8;
     let mut data = message.to_vec();
@@ -1053,6 +1371,90 @@ fn sha1(message: &[u8]) -> [u8; 20] {
         output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     output
+}
+
+async fn build_vless_client_config(tls: &VlessClientTlsOptions) -> Result<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    if tls.certificate_path.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    } else {
+        let data = tokio::fs::read(&tls.certificate_path)
+            .await
+            .with_context(|| format!("read {}", tls.certificate_path))?;
+        let mut reader = Cursor::new(data);
+        for certificate in rustls_pemfile::certs(&mut reader) {
+            roots.add(certificate?)?;
+        }
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = if tls.insecure {
+        ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(VlessNoVerifier))
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = if tls.alpn.is_empty() {
+        vec![b"http/1.1".to_vec()]
+    } else {
+        tls.alpn
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect()
+    };
+    Ok(config)
+}
+
+#[derive(Debug)]
+struct VlessNoVerifier;
+
+impl ServerCertVerifier for VlessNoVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1192,9 +1594,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vless_websocket_outbound_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_address = listener.local_addr().unwrap();
+        let uuid = parse_uuid("d4f2ad1c-f6db-481e-91de-9d551f8885c9").unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            assert_eq!(request.path, "/proxy");
+            let accept = websocket_accept(request.header("sec-websocket-key").unwrap());
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut websocket = WebSocketStream::new(stream, request.tail, Vec::new(), false);
+            let users = HashMap::from([(uuid, "test".to_owned())]);
+            let (destination, _) = read_vless_request(&mut websocket, &users).await.unwrap();
+            assert_eq!(destination, Address::new("example.com", 443).unwrap());
+            websocket.write_all(&[VLESS_VERSION, 0]).await.unwrap();
+            let mut payload = [0u8; 4];
+            websocket.read_exact(&mut payload).await.unwrap();
+            websocket.write_all(&payload).await.unwrap();
+        });
+        let outbound = VlessOutbound {
+            tag: "vless-out".to_owned(),
+            server: server_address.ip().to_string(),
+            server_port: server_address.port(),
+            uuid,
+            path: "/proxy".to_owned(),
+            headers: HashMap::new(),
+            max_early_data: 0,
+            early_data_header_name: String::new(),
+            tls: VlessClientTlsOptions::default(),
+            dialer: sing_box_core::SystemDialer::new(
+                None,
+                None,
+                sing_box_core::DomainStrategy::AsIs,
+            ),
+        };
+        let session = Session::outbound(Address::new("example.com", 443).unwrap());
+        let mut stream = outbound.connect(&session).await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ping");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn writes_websocket_header_and_payload_together() {
         let writer = CountingWriter::default();
-        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new());
+        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new(), false);
 
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
@@ -1204,9 +1659,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_websocket_frames_are_masked() {
+        let writer = CountingWriter::default();
+        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new(), true);
+
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let frame = &stream.inner.data;
+        assert_eq!(frame[0], 0x82);
+        assert_eq!(frame[1], 0x84);
+        let mask: [u8; 4] = frame[2..6].try_into().unwrap();
+        let payload = frame[6..]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4])
+            .collect::<Vec<_>>();
+        assert_eq!(payload, b"ping");
+    }
+
+    #[tokio::test]
     async fn preserves_a_frame_across_partial_socket_writes() {
         let writer = PartialWriter::default();
-        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new());
+        let mut stream = WebSocketStream::new(writer, Vec::new(), Vec::new(), false);
 
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
@@ -1217,7 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn reads_masked_websocket_payload_without_a_bridge() {
         let (mut client, server) = tokio::io::duplex(128);
-        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new());
+        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new(), false);
         let frame = masked_frame(0x2, true, b"ping");
         client.write_all(&frame).await.unwrap();
 
@@ -1228,9 +1703,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_reads_unmasked_websocket_payload() {
+        let (mut server, client) = tokio::io::duplex(128);
+        let mut stream = WebSocketStream::new(client, Vec::new(), Vec::new(), true);
+        server
+            .write_all(&[0x82, 4, b'p', b'i', b'n', b'g'])
+            .await
+            .unwrap();
+
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+
+        assert_eq!(&payload, b"ping");
+    }
+
+    #[tokio::test]
     async fn handles_fragmented_data_and_ping_without_background_tasks() {
         let (mut client, server) = tokio::io::duplex(256);
-        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new());
+        let mut stream = WebSocketStream::new(server, Vec::new(), Vec::new(), false);
         let mut frames = masked_frame(0x2, false, b"pi");
         frames.extend_from_slice(&masked_frame(0x9, true, b"ok"));
         frames.extend_from_slice(&masked_frame(0x0, true, b"ng"));

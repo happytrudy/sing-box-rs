@@ -1686,13 +1686,18 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sing-box-core",
  "sing-box-tls",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -42,7 +42,7 @@ not the upstream protocol's theoretical capabilities.
 | SunnyQUIC + native QUIC TLS + Brutal | Yes | Yes | TCP and UDP; rate pacing and optional loss compensation | `sunnyquic-server-brutal.json`, `sunnyquic-client-brutal.json` |
 | Cloudflared + HTTP/2 | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and Cap'n Proto RPC | `cloudflared-inbound.json` with `protocol` set to `http2` |
 | Cloudflared + QUIC | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and datagram v2/v3 | `cloudflared-inbound.json` |
-| VLESS + WebSocket | Yes | No | TCP; UUID authentication, path validation, masking, and early data | `vless-ws-server.json` |
+| VLESS + WebSocket | Yes | Yes | TCP; UUID authentication, path validation, client/server masking, TLS, and early data | `vless-ws-server.json`, `vless-ws-client.json` |
 | VLESS + WebSocket + Reality | Yes | No | TCP; Reality server authentication and invalid-client fallback | `vless-reality-ws-server.json` |
 | AnyTLS + standard TLS | Yes | Yes | TCP and UDP-over-TCP; v2 multiplexing, padding, static certificate, or `certificate_provider` | `anytls-server.json`, `anytls-client.json` |
 | AnyTLS + Reality | Yes | No | TCP and UDP-over-TCP; Reality replaces the inbound TLS acceptor | `anytls-reality-server.json` |
@@ -66,8 +66,8 @@ validation.
   profile set.
 - [ ] Align Hysteria2 outbound TLS with sing-box, including system roots,
   `insecure`, ALPN, certificate pinning, and optional certificate providers.
-- [ ] Add VLESS outbound support and additional transports; the current VLESS
-  adapter is WebSocket inbound TCP only.
+- [ ] Add VLESS UDP and additional transports; the current VLESS adapter is
+  WebSocket TCP only.
 - [ ] Add ShadowQUIC outbound UDP using the existing QUIC packet-association
   API.
 - [ ] Compare Cloudflared HTTP/2 and QUIC framing against the latest upstream
@@ -290,14 +290,14 @@ the IPv6 and IPv4 loopback addresses. A full endpoint such as
 `127.0.0.1:443` or `[::1]:443` may be used instead of a separate
 `listen_port`.
 
-VLESS currently supports TCP over a WebSocket inbound. The implementation
-validates the configured UUID, WebSocket path, RFC 6455 client masking, and the
-VLESS destination header before handing the stream to the common router. The
-`early_data_header_name` option accepts URL-safe Base64 VLESS request bytes in
-the named HTTP header, matching the V2Ray WebSocket transport. VLESS UDP and
-outbound support are not implemented yet. VLESS and AnyTLS can both select the
-shared `tls.reality` server mode; Reality authentication and fallback are
-implemented in `sing-box-tls`, not in either protocol adapter.
+VLESS supports TCP over WebSocket in both directions. The implementation
+validates the configured UUID, WebSocket path, RFC 6455 masking direction, and
+the VLESS destination header. The outbound supports standard TLS, custom root
+certificates, custom headers, and `max_early_data` with
+`early_data_header_name`. VLESS UDP and transports other than WebSocket are not
+implemented. VLESS and AnyTLS can both select the shared `tls.reality` server
+mode; Reality authentication and fallback are implemented in `sing-box-tls`,
+not in either protocol adapter.
 
 ### Reality TLS
 
@@ -346,12 +346,12 @@ AnyTLS uses the sing-box protocol shape: the inbound accepts `users` and TLS
 certificate files or a shared `certificate_provider` tag; the outbound accepts
 `server`, `server_port`, `password`, TLS options, and string durations such as
 `"30s"` for idle-session cleanup. TCP streams use AnyTLS v2 settings,
-SYN/PSH/FIN/SYNACK frames, SOCKS destination encoding, and the newest idle TLS
-session for multiplexing. UDP uses `sp.v2.udp-over-tcp.arpa` with the sing-box
-UDP-over-TCP v2 packet format. The default and configured padding schemes are
-negotiated by MD5 and applied with `cmdWaste` frames. Padding ranges use the
-existing AWS-LC secure random source without adding a separate random-number
-dependency.
+SYN/PSH/FIN/SYNACK frames, SOCKS destination encoding, and reuse one idle TLS
+session per active stream. UDP uses `sp.v2.udp-over-tcp.arpa` with the
+sing-box UDP-over-TCP v2 packet format. The default and configured padding
+schemes are negotiated by MD5 and applied with `cmdWaste` frames. Padding
+ranges use the existing AWS-LC secure random source without adding a separate
+random-number dependency.
 
 AnyTLS can also use the JLS TLS camouflage from the Rustls fork used by this
 workspace. Set `enable_jls`, `jls_username`, and `jls_password` in the `tls`

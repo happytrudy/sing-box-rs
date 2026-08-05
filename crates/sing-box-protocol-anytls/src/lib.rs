@@ -336,7 +336,6 @@ struct AnyTlsOutbound {
     min_idle_session: usize,
     system_dialer: sing_box_core::SystemDialer,
     sessions: Arc<Mutex<Vec<Arc<ClientSession>>>>,
-    connect_lock: Mutex<()>,
     running: Mutex<Option<RunningOutbound>>,
     padding: Arc<RwLock<PaddingScheme>>,
 }
@@ -459,25 +458,14 @@ impl sing_box_core::Dialer for AnyTlsOutbound {
 
 impl AnyTlsOutbound {
     async fn acquire_session(&self) -> Result<Arc<ClientSession>> {
-        let now = Instant::now();
         let mut sessions = self.sessions.lock().await;
         sessions.retain(|candidate| !candidate.closed.load(Ordering::Acquire));
-        sessions.retain(|candidate| {
-            candidate.active.load(Ordering::Acquire) > 0
-                || candidate
-                    .last_used
-                    .try_lock()
-                    .map(|last_used| now.duration_since(*last_used) < self.idle_session_timeout)
-                    .unwrap_or(true)
-        });
-        if let Some(client) = sessions.last().cloned() {
-            return Ok(client);
-        }
-        drop(sessions);
-        let _connect_lock = self.connect_lock.lock().await;
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|candidate| !candidate.closed.load(Ordering::Acquire));
-        if let Some(client) = sessions.last().cloned() {
+        if let Some(client) = sessions
+            .iter()
+            .rev()
+            .find(|candidate| candidate.try_reserve())
+            .cloned()
+        {
             return Ok(client);
         }
         drop(sessions);
@@ -490,6 +478,7 @@ impl AnyTlsOutbound {
             Arc::clone(&self.padding),
         )
         .await?;
+        anyhow::ensure!(client.try_reserve(), "new AnyTLS session is not idle");
         self.sessions.lock().await.push(Arc::clone(&client));
         Ok(client)
     }
@@ -640,7 +629,6 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 min_idle_session: options.min_idle_session,
                 system_dialer: context.system_dialer,
                 sessions: Arc::new(Mutex::new(Vec::new())),
-                connect_lock: Mutex::new(()),
                 running: Mutex::new(None),
                 padding: Arc::new(RwLock::new(PaddingScheme::parse("")?)),
             }) as Arc<dyn Outbound>)
@@ -1111,6 +1099,14 @@ async fn handle_server_udp_stream(
 }
 
 impl ClientSession {
+    fn try_reserve(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && self
+                .active
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
     async fn connect(
         server: &str,
         port: u16,
@@ -1245,7 +1241,6 @@ impl ClientSession {
                 cancel: CancellationToken::new(),
             },
         );
-        self.active.fetch_add(1, Ordering::AcqRel);
         *self.last_used.lock().await = Instant::now();
         let stream_cancel = self
             .streams
@@ -2167,6 +2162,28 @@ mod tests {
         timeout(Duration::from_secs(1), done)
             .await
             .expect("AnyTLS reader did not stop after session close");
+    }
+
+    #[test]
+    fn active_client_session_is_not_reserved_twice() {
+        let (tx, _rx) = mpsc::channel(1);
+        let session = ClientSession {
+            tx,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            next_stream_id: AtomicU32::new(1),
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+            done: Notify::new(),
+            supports_v2: AtomicBool::new(false),
+            last_used: Mutex::new(Instant::now()),
+            padding: Arc::new(RwLock::new(PaddingScheme::parse("").unwrap())),
+        };
+
+        assert!(session.try_reserve());
+        assert!(!session.try_reserve());
+        session.active.store(0, Ordering::Release);
+        assert!(session.try_reserve());
     }
 
     #[test]

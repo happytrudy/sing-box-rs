@@ -6,13 +6,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aws-lc-rs.workspace = true
 async-trait.workspace = true
 serde.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 sing-box-core = { path = "../sing-box-core" }
 sing-box-tls = { path = "../sing-box-tls" }
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

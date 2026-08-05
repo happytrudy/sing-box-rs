@@ -1,0 +1,36 @@
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-ws-out",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "d4f2ad1c-f6db-481e-91de-9d551f8885c9",
+      "transport": {
+        "type": "ws",
+        "path": "/assets/js/chunks/main.d4f2ad1c.js",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "vless.example.com"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "vless-ws-out"
+  }
+}
