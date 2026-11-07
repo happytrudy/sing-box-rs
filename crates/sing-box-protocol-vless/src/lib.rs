@@ -1211,7 +1211,7 @@ fn parse_uuid(value: &str) -> Result<[u8; 16]> {
         "VLESS UUID must contain 32 hexadecimal digits"
     );
     let mut output = [0u8; 16];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         output[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Ok(output)
@@ -1346,7 +1346,7 @@ fn sha1(message: &[u8]) -> [u8; 20] {
         0x10325476,
         0xC3D2E1F0,
     ];
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut words = [0u32; 80];
         for (index, word) in words[..16].iter_mut().enumerate() {
             *word = u32::from_be_bytes([

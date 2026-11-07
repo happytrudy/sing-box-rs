@@ -30,6 +30,7 @@ pub enum RuleSetFetchResult {
     },
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait RuleSetFetcher: Send + Sync {
     async fn fetch(&self, url: &str, etag: Option<&str>) -> Result<RuleSetFetchResult>;

@@ -87,6 +87,7 @@ impl Drop for Packet {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PacketConnection: Send + Sync {
     async fn send(&self, packet: Packet) -> Result<()>;
@@ -205,6 +206,7 @@ pub const START_STAGES: [StartStage; 4] = [
     StartStage::Started,
 ];
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Lifecycle: Send + Sync {
     async fn start(&self, _stage: StartStage) -> Result<()> {
@@ -216,11 +218,13 @@ pub trait Lifecycle: Send + Sync {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Dialer: Send + Sync {
     async fn connect(&self, session: &Session) -> Result<BoxStream>;
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Outbound: Lifecycle + Dialer {
     fn kind(&self) -> &'static str;
@@ -235,6 +239,7 @@ pub trait Outbound: Lifecycle + Dialer {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Inbound: Lifecycle {
     fn kind(&self) -> &'static str;
@@ -265,6 +270,7 @@ pub trait CertificateProvider: Lifecycle {
     fn subscribe(&self, server_name: &str) -> Result<watch::Receiver<Option<Arc<Certificate>>>>;
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DomainResolver: Send + Sync {
     async fn lookup(

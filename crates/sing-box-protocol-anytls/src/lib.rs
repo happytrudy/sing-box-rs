@@ -1197,12 +1197,27 @@ async fn handle_server_udp_stream(
 impl ClientSession {
     fn try_reserve(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
-            && self
-                .active
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                    (active < MAX_CONCURRENT_STREAMS_PER_SESSION).then_some(active + 1)
-                })
-                .is_ok()
+            && self.update_active(|active| {
+                (active < MAX_CONCURRENT_STREAMS_PER_SESSION).then_some(active + 1)
+            })
+    }
+
+    fn update_active(&self, mut update: impl FnMut(usize) -> Option<usize>) -> bool {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            let Some(next) = update(active) else {
+                return false;
+            };
+            match self.active.compare_exchange_weak(
+                active,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
     }
 
     async fn connect(
@@ -1436,11 +1451,7 @@ impl ClientSession {
     }
 
     fn release_slot(&self) {
-        let _ = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                active.checked_sub(1)
-            });
+        self.update_active(|active| active.checked_sub(1));
         if let Some(changed) = self
             .pool_changed
             .lock()
@@ -1468,11 +1479,7 @@ impl ClientSession {
         for stream in streams {
             stream.cancel.cancel();
         }
-        let _ = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                Some(active.saturating_sub(removed))
-            });
+        self.update_active(|active| Some(active.saturating_sub(removed)));
         if let Some(changed) = self
             .pool_changed
             .lock()
@@ -1920,7 +1927,7 @@ fn md5_hex(input: &[u8]) -> String {
     }
     message.extend_from_slice(&bit_len.to_le_bytes());
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0u32; 16];
         for (index, word) in words.iter_mut().enumerate() {
             let offset = index * 4;
