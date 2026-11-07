@@ -616,7 +616,11 @@ fn parse_quic_options(options: &QuicOptions) -> Result<QuicTransportOptions> {
             .map(parse_memory_bytes)
             .transpose()?
             .unwrap_or_default(),
-        max_concurrent_streams: options.max_concurrent_streams,
+        max_concurrent_streams: if options.max_concurrent_streams == 0 {
+            256
+        } else {
+            options.max_concurrent_streams
+        },
         initial_packet_size: options.initial_packet_size,
         disable_path_mtu_discovery: options.disable_path_mtu_discovery,
     })

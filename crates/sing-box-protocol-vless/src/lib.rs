@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context as TaskContext, Poll},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -25,7 +26,7 @@ use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
     task::JoinHandle,
 };
 use tokio_rustls::TlsConnector;
@@ -35,6 +36,8 @@ const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
 const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_INBOUND_CONNECTIONS: usize = 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Clone, Debug, Deserialize)]
@@ -178,6 +181,7 @@ impl Lifecycle for VlessInbound {
         *self.local_addr.write().expect("VLESS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
         let connection_tasks = ConnectionTasks::new();
+        let connection_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
         let mut tasks = Vec::with_capacity(listeners.len());
         for listener in listeners {
             let connection_tasks_for_listener = connection_tasks.clone();
@@ -185,6 +189,7 @@ impl Lifecycle for VlessInbound {
                 listener,
                 cancel.clone(),
                 connection_tasks_for_listener,
+                Arc::clone(&connection_slots),
                 Arc::clone(&self.router),
                 self.tag.clone(),
                 self.path.clone(),
@@ -430,6 +435,7 @@ async fn run_listener(
     listener: TcpListener,
     cancel: CancellationToken,
     connection_tasks: ConnectionTasks,
+    connection_slots: Arc<Semaphore>,
     router: Arc<Router>,
     tag: String,
     path: String,
@@ -442,6 +448,10 @@ async fn run_listener(
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, source)) => {
+                    let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let router = Arc::clone(&router);
                     let users = Arc::clone(&users);
                     let tag = tag.clone();
@@ -450,6 +460,7 @@ async fn run_listener(
                     let reality = reality.clone();
                     let connection_cancel = cancel.clone();
                     connection_tasks.spawn(async move {
+                        let _permit = permit;
                         tokio::select! {
                             _ = connection_cancel.cancelled() => {}
                             result = handle_connection(
@@ -491,7 +502,10 @@ async fn handle_connection(
 ) -> Result<()> {
     configure_tcp_stream(&stream)?;
     if let Some(reality) = reality {
-        let Some(stream) = reality.accept(stream).await? else {
+        let Some(stream) = tokio::time::timeout(HANDSHAKE_TIMEOUT, reality.accept(stream))
+            .await
+            .context("VLESS Reality handshake timed out")??
+        else {
             return Ok(());
         };
         return handle_connection_inner(
@@ -533,7 +547,9 @@ async fn handle_connection_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let request = read_http_request(&mut stream).await?;
+    let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_http_request(&mut stream))
+        .await
+        .context("VLESS HTTP handshake timed out")??;
     if request.method != "GET" {
         write_http_error(&mut stream, 405, "Method Not Allowed").await?;
         return Ok(());
@@ -565,7 +581,12 @@ where
     stream.flush().await?;
 
     let mut application = WebSocketStream::new(stream, request.tail, early_data, false);
-    let (destination, user) = read_vless_request(&mut application, &users).await?;
+    let (destination, user) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_vless_request(&mut application, &users),
+    )
+    .await
+    .context("VLESS request handshake timed out")??;
     application.write_all(&[VLESS_VERSION, 0]).await?;
     let session = Session::inbound(Network::Tcp, source, destination, tag, "vless", Some(user));
     router.route(session, Box::new(application)).await
