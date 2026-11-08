@@ -1,0 +1,35 @@
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-xhttp-h3-in",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "d4f2ad1c-f6db-481e-91de-9d551f8885c9"
+        }
+      ],
+      "transport": {
+        "type": "xhttp",
+        "path": "/tunnel",
+        "http_version": "h3",
+        "host": "vless.example.com"
+      },
+      "tls": {
+        "enabled": true,
+        "certificate_path": "examples/vless-cert.pem",
+        "key_path": "examples/vless-key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

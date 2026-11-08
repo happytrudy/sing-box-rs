@@ -43,6 +43,8 @@ not the upstream protocol's theoretical capabilities.
 | Cloudflared + HTTP/2 | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and Cap'n Proto RPC | `cloudflared-inbound.json` with `protocol` set to `http2` |
 | Cloudflared + QUIC | Yes | No | Remote-managed tunnel; TCP, HTTP, WebSocket, and datagram v2/v3 | `cloudflared-inbound.json` |
 | VLESS + WebSocket | Yes | Yes | TCP; UUID authentication, path validation, client/server masking, TLS, and early data | `vless-ws-server.json`, `vless-ws-client.json` |
+| VLESS + XHTTP/HTTP/2 | Yes | Yes | TCP full-duplex stream over one HTTPS POST; UUID authentication and configurable path/headers | `vless-xhttp-h2-server.json`, `vless-xhttp-h2-client.json` |
+| VLESS + XHTTP/HTTP/3 | Yes | Yes | TCP full-duplex stream over one HTTP/3 POST; UUID authentication and configurable path/headers | `vless-xhttp-h3-server.json`, `vless-xhttp-h3-client.json` |
 | VLESS + WebSocket + Reality | Yes | No | TCP; Reality server authentication and invalid-client fallback | `vless-reality-ws-server.json` |
 | AnyTLS + standard TLS | Yes | Yes | TCP and UDP-over-TCP; v2 multiplexing, padding, static certificate, or `certificate_provider` | `anytls-server.json`, `anytls-client.json` |
 | AnyTLS + Reality | Yes | No | TCP and UDP-over-TCP; Reality replaces the inbound TLS acceptor | `anytls-reality-server.json` |
@@ -66,8 +68,7 @@ validation.
   profile set.
 - [ ] Align Hysteria2 outbound TLS with sing-box, including system roots,
   `insecure`, ALPN, certificate pinning, and optional certificate providers.
-- [ ] Add VLESS UDP and additional transports; the current VLESS adapter is
-  WebSocket TCP only.
+- [ ] Add VLESS UDP and XHTTP session modes beyond the current single POST stream.
 - [ ] Add ShadowQUIC outbound UDP using the existing QUIC packet-association
   API.
 - [ ] Compare Cloudflared HTTP/2 and QUIC framing against the latest upstream
@@ -290,14 +291,16 @@ the IPv6 and IPv4 loopback addresses. A full endpoint such as
 `127.0.0.1:443` or `[::1]:443` may be used instead of a separate
 `listen_port`.
 
-VLESS supports TCP over WebSocket in both directions. The implementation
-validates the configured UUID, WebSocket path, RFC 6455 masking direction, and
-the VLESS destination header. The outbound supports standard TLS, custom root
-certificates, custom headers, and `max_early_data` with
-`early_data_header_name`. VLESS UDP and transports other than WebSocket are not
-implemented. VLESS and AnyTLS can both select the shared `tls.reality` server
-mode; Reality authentication and fallback are implemented in `sing-box-tls`,
-not in either protocol adapter.
+VLESS supports TCP over WebSocket and XHTTP in both directions. XHTTP supports
+`http_version: "h2"` over TLS/TCP and `http_version: "h3"` over QUIC, using one
+HTTPS POST request as a full-duplex stream. Configure `tls.certificate_path`
+and `tls.key_path` on the inbound; outbound TLS supports the existing custom
+root and server-name options. XHTTP validates the configured path and optional
+host/custom headers. This migration currently supports the single stream POST
+mode; XHTTP split upload, request pooling, and other session modes are not yet
+implemented. VLESS UDP remains unsupported. VLESS WebSocket and AnyTLS can use
+the shared `tls.reality` server mode; XHTTP requires certificate TLS and does
+not support Reality.
 
 ### Reality TLS
 

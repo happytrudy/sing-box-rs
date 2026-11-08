@@ -12,15 +12,18 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use bytes::{Buf, Bytes};
+use http::{Request, Response, StatusCode};
 use rustls::{
-    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig as RustlsServerConfig,
+    SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use serde::Deserialize;
 use sing_box_core::{
     Address, ConnectionTasks, Dialer, Inbound, InboundBuildContext, Lifecycle, Network, Registry,
-    Router, Session, bind_tcp_listeners,
+    Router, Session, bind_tcp_listeners, listen_addresses,
 };
 use sing_box_tls::{RealityAcceptor, RealityOptions, RealityServerConfig};
 use tokio::{
@@ -29,7 +32,7 @@ use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinHandle,
 };
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 const VLESS_VERSION: u8 = 0;
@@ -38,6 +41,7 @@ const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
 const MAX_WS_FRAME_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_INBOUND_CONNECTIONS: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const XHTTP_DUPLEX_CAPACITY: usize = 256 * 1024;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[derive(Clone, Debug, Deserialize)]
@@ -63,6 +67,10 @@ struct VlessTlsOptions {
     #[serde(default)]
     alpn: Vec<String>,
     #[serde(default)]
+    certificate_path: String,
+    #[serde(default)]
+    key_path: String,
+    #[serde(default)]
     reality: RealityOptions,
 }
 
@@ -82,6 +90,12 @@ struct WebSocketOptions {
     path: String,
     #[serde(default)]
     early_data_header_name: String,
+    #[serde(default = "default_xhttp_version")]
+    http_version: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -112,6 +126,10 @@ struct WebSocketOutboundOptions {
     max_early_data: usize,
     #[serde(default)]
     early_data_header_name: String,
+    #[serde(default = "default_xhttp_version")]
+    http_version: String,
+    #[serde(default)]
+    host: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -129,6 +147,10 @@ struct VlessClientTlsOptions {
     alpn: Vec<String>,
 }
 
+fn default_xhttp_version() -> String {
+    "h2".to_owned()
+}
+
 fn default_listen() -> String {
     "127.0.0.1".to_owned()
 }
@@ -137,11 +159,16 @@ struct Running {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     connection_tasks: ConnectionTasks,
+    h3_endpoint: Option<quinn::Endpoint>,
 }
 
 struct VlessInbound {
     tag: String,
+    transport_kind: String,
+    http_version: String,
     path: String,
+    host: String,
+    headers: HashMap<String, String>,
     early_data_header_name: String,
     users: Arc<HashMap<[u8; 16], String>>,
     router: Arc<Router>,
@@ -150,6 +177,8 @@ struct VlessInbound {
     running: Mutex<Option<Running>>,
     local_addr: RwLock<Option<SocketAddr>>,
     reality: Option<Arc<RealityAcceptor>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    h3_server_config: Option<quinn::ServerConfig>,
 }
 
 struct VlessOutbound {
@@ -157,7 +186,10 @@ struct VlessOutbound {
     server: String,
     server_port: u16,
     uuid: [u8; 16],
+    transport_kind: String,
+    http_version: String,
     path: String,
+    host: String,
     headers: HashMap<String, String>,
     max_early_data: usize,
     early_data_header_name: String,
@@ -174,42 +206,93 @@ impl Lifecycle for VlessInbound {
         if self.running.lock().await.is_some() {
             return Ok(());
         }
-        let listeners = bind_tcp_listeners(&self.listen, self.listen_port)
-            .await
-            .context("bind VLESS inbound")?;
-        let local_addr = listeners[0].local_addr()?;
-        *self.local_addr.write().expect("VLESS address lock") = Some(local_addr);
         let cancel = CancellationToken::new();
         let connection_tasks = ConnectionTasks::new();
         let connection_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
-        let mut tasks = Vec::with_capacity(listeners.len());
-        for listener in listeners {
-            let connection_tasks_for_listener = connection_tasks.clone();
-            tasks.push(tokio::spawn(run_listener(
-                listener,
-                cancel.clone(),
-                connection_tasks_for_listener,
-                Arc::clone(&connection_slots),
-                Arc::clone(&self.router),
-                self.tag.clone(),
-                self.path.clone(),
-                self.early_data_header_name.clone(),
-                Arc::clone(&self.users),
-                self.reality.clone(),
-            )));
-        }
+        let (local_addr, tasks, h3_endpoint) =
+            if self.transport_kind == "xhttp" && self.http_version == "h3" {
+                let address = listen_addresses(&self.listen, self.listen_port)?
+                    .into_iter()
+                    .next()
+                    .context("VLESS XHTTP3 requires a listener address")?;
+                let server_config = self
+                    .h3_server_config
+                    .clone()
+                    .context("VLESS XHTTP3 server TLS is not configured")?;
+                let endpoint = quinn::Endpoint::server(server_config, address)
+                    .context("bind VLESS XHTTP3 endpoint")?;
+                let local_addr = endpoint.local_addr()?;
+                let task = tokio::spawn(run_h3_listener(
+                    endpoint.clone(),
+                    cancel.clone(),
+                    connection_tasks.clone(),
+                    Arc::clone(&connection_slots),
+                    Arc::clone(&self.router),
+                    self.tag.clone(),
+                    self.path.clone(),
+                    self.host.clone(),
+                    self.headers.clone(),
+                    Arc::clone(&self.users),
+                ));
+                (local_addr, vec![task], Some(endpoint))
+            } else {
+                let listeners = bind_tcp_listeners(&self.listen, self.listen_port)
+                    .await
+                    .context("bind VLESS inbound")?;
+                let local_addr = listeners[0].local_addr()?;
+                let mut tasks = Vec::with_capacity(listeners.len());
+                for listener in listeners {
+                    let connection_tasks_for_listener = connection_tasks.clone();
+                    if self.transport_kind == "xhttp" {
+                        tasks.push(tokio::spawn(run_h2_listener(
+                            listener,
+                            cancel.clone(),
+                            connection_tasks_for_listener,
+                            Arc::clone(&connection_slots),
+                            Arc::clone(&self.router),
+                            self.tag.clone(),
+                            self.path.clone(),
+                            self.host.clone(),
+                            self.headers.clone(),
+                            Arc::clone(&self.users),
+                            self.tls_acceptor
+                                .clone()
+                                .context("VLESS XHTTP2 TLS is not configured")?,
+                        )));
+                    } else {
+                        tasks.push(tokio::spawn(run_listener(
+                            listener,
+                            cancel.clone(),
+                            connection_tasks_for_listener,
+                            Arc::clone(&connection_slots),
+                            Arc::clone(&self.router),
+                            self.tag.clone(),
+                            self.path.clone(),
+                            self.early_data_header_name.clone(),
+                            Arc::clone(&self.users),
+                            self.reality.clone(),
+                        )));
+                    }
+                }
+                (local_addr, tasks, None)
+            };
+        *self.local_addr.write().expect("VLESS address lock") = Some(local_addr);
         *self.running.lock().await = Some(Running {
             cancel,
             tasks,
             connection_tasks,
+            h3_endpoint,
         });
-        tracing::info!(tag = %self.tag, %local_addr, "started VLESS WebSocket inbound");
+        tracing::info!(tag = %self.tag, %local_addr, transport = %self.transport_kind, "started VLESS inbound");
         Ok(())
     }
 
     async fn close(&self) -> Result<()> {
         if let Some(running) = self.running.lock().await.take() {
             running.cancel.cancel();
+            if let Some(endpoint) = running.h3_endpoint {
+                endpoint.close(0u32.into(), b"VLESS inbound closed");
+            }
             for task in running.tasks {
                 task.await?;
             }
@@ -242,6 +325,9 @@ impl Dialer for VlessOutbound {
             session.network == Network::Tcp,
             "VLESS outbound only supports TCP"
         );
+        if self.transport_kind == "xhttp" {
+            return self.connect_xhttp(session).await;
+        }
         let server = Address::new(self.server.clone(), self.server_port)?;
         let transport = self.dialer.connect(&Session::outbound(server)).await?;
         let stream = if self.tls.enabled {
@@ -327,6 +413,471 @@ impl Dialer for VlessOutbound {
     }
 }
 
+impl VlessOutbound {
+    async fn connect_xhttp(&self, session: &Session) -> Result<sing_box_core::BoxStream> {
+        let authority = if !self.host.is_empty() {
+            self.host.clone()
+        } else {
+            http_authority(&self.server, self.server_port)
+        };
+        let (path, query) = xhttp_path(&self.path)?;
+        if self.http_version == "h3" {
+            let addresses = self.dialer.resolve(&self.server, self.server_port).await?;
+            let address = addresses
+                .into_iter()
+                .next()
+                .context("VLESS XHTTP3 server did not resolve")?;
+            let server_name = if self.tls.server_name.is_empty() {
+                self.server.as_str()
+            } else {
+                self.tls.server_name.as_str()
+            };
+            let mut tls = build_vless_client_config(&self.tls).await?;
+            tls.alpn_protocols = vec![b"h3".to_vec()];
+            let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+                .context("build VLESS XHTTP3 TLS config")?;
+            let local = if address.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            };
+            let endpoint = quinn::Endpoint::client(local)?;
+            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_tls)));
+            let connection = endpoint
+                .connect(address, server_name)?
+                .await
+                .context("VLESS XHTTP3 QUIC handshake")?;
+            let (mut driver, mut sender) = h3::client::builder()
+                .build(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .context("start VLESS XHTTP3 connection")?;
+            tokio::spawn(async move {
+                let _ = driver.wait_idle().await;
+            });
+            let request =
+                build_xhttp_request(&authority, &path, query.as_deref(), true, &self.headers)?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .context("send VLESS XHTTP3 request")?;
+            let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.recv_response())
+                .await
+                .context("VLESS XHTTP3 response timed out")?
+                .context("receive VLESS XHTTP3 response")?;
+            anyhow::ensure!(
+                response.status() == StatusCode::OK,
+                "VLESS XHTTP3 server returned HTTP status {}",
+                response.status()
+            );
+            let (send, recv) = stream.split();
+            let stream = xhttp_duplex_h3(send, recv, endpoint, connection);
+            finish_xhttp_client_stream(stream, &self.uuid, &session.destination).await
+        } else {
+            let server = Address::new(self.server.clone(), self.server_port)?;
+            let transport = self.dialer.connect(&Session::outbound(server)).await?;
+            let stream = if self.tls.enabled {
+                let mut tls_options = self.tls.clone();
+                if tls_options.alpn.is_empty() {
+                    tls_options.alpn = vec!["h2".to_owned()];
+                }
+                let config = build_vless_client_config(&tls_options).await?;
+                let connector = TlsConnector::from(Arc::new(config));
+                let name = if tls_options.server_name.is_empty() {
+                    self.server.clone()
+                } else {
+                    tls_options.server_name
+                };
+                let name = ServerName::try_from(name).context("invalid VLESS server_name")?;
+                Box::new(
+                    connector
+                        .connect(name, transport)
+                        .await
+                        .context("VLESS XHTTP2 TLS handshake")?,
+                ) as sing_box_core::BoxStream
+            } else {
+                transport
+            };
+            let request = build_xhttp_request(
+                &authority,
+                &path,
+                query.as_deref(),
+                self.tls.enabled,
+                &self.headers,
+            )?;
+            let stream = xhttp_client_h2(stream, request).await?;
+            finish_xhttp_client_stream(stream, &self.uuid, &session.destination).await
+        }
+    }
+}
+
+async fn finish_xhttp_client_stream(
+    mut stream: sing_box_core::BoxStream,
+    uuid: &[u8; 16],
+    destination: &Address,
+) -> Result<sing_box_core::BoxStream> {
+    let request = encode_vless_request(uuid, destination)?;
+    stream.write_all(&request).await?;
+    stream.flush().await?;
+    let mut response = [0u8; 2];
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut response))
+        .await
+        .context("VLESS XHTTP response timed out")??;
+    anyhow::ensure!(
+        response == [VLESS_VERSION, 0],
+        "invalid VLESS XHTTP response"
+    );
+    Ok(stream)
+}
+
+fn http_authority(server: &str, port: u16) -> String {
+    if server.contains(':') && !server.starts_with('[') {
+        format!("[{server}]:{port}")
+    } else {
+        format!("{server}:{port}")
+    }
+}
+
+fn xhttp_path(value: &str) -> Result<(String, Option<String>)> {
+    let (path, query) = value
+        .split_once('?')
+        .map_or((value, None), |(p, q)| (p, Some(q.to_owned())));
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    anyhow::ensure!(
+        !path.contains('#') && !path.contains(' '),
+        "invalid VLESS XHTTP path"
+    );
+    Ok((path, query))
+}
+
+fn build_xhttp_request(
+    authority: &str,
+    path: &str,
+    query: Option<&str>,
+    tls: bool,
+    headers: &HashMap<String, String>,
+) -> Result<Request<()>> {
+    let uri = format!(
+        "{}://{}{}{}",
+        if tls { "https" } else { "http" },
+        authority,
+        path,
+        query.map(|q| format!("?{q}")).unwrap_or_default()
+    );
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .version(http::Version::HTTP_2);
+    for (name, value) in headers {
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host" | "content-length" | "transfer-encoding"
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder.body(()).context("build VLESS XHTTP request")
+}
+
+async fn xhttp_client_h2(
+    stream: sing_box_core::BoxStream,
+    request: Request<()>,
+) -> Result<sing_box_core::BoxStream> {
+    let (mut sender, connection) = h2::client::handshake(stream)
+        .await
+        .context("VLESS XHTTP2 handshake")?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "VLESS XHTTP2 connection closed");
+        }
+    });
+    let (response, send) = sender
+        .send_request(request, false)
+        .context("send VLESS XHTTP2 request")?;
+    let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, response)
+        .await
+        .context("VLESS XHTTP2 response timed out")??;
+    anyhow::ensure!(
+        response.status() == StatusCode::OK,
+        "VLESS XHTTP2 server returned HTTP status {}",
+        response.status()
+    );
+    let (local, carrier) = tokio::io::duplex(XHTTP_DUPLEX_CAPACITY);
+    tokio::spawn(bridge_h2(send, response.into_body(), carrier));
+    Ok(Box::new(local))
+}
+
+async fn bridge_h2<S>(mut send: h2::SendStream<Bytes>, mut recv: h2::RecvStream, carrier: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(carrier);
+    let upload = async {
+        let mut buffer = vec![0; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ = send.send_data(Bytes::new(), true);
+                    break;
+                }
+                Ok(n) => {
+                    if send
+                        .send_data(Bytes::copy_from_slice(&buffer[..n]), false)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    let download = async {
+        while let Some(chunk) = recv.data().await {
+            match chunk {
+                Ok(bytes) => {
+                    let size = bytes.len();
+                    if writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                    let _ = recv.flow_control().release_capacity(size);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = writer.shutdown().await;
+    };
+    tokio::join!(upload, download);
+}
+
+fn xhttp_duplex_h3(
+    send: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    recv: h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+) -> sing_box_core::BoxStream {
+    let (local, carrier) = tokio::io::duplex(XHTTP_DUPLEX_CAPACITY);
+    tokio::spawn(async move {
+        bridge_h3_client(send, recv, carrier).await;
+        connection.close(0u32.into(), b"XHTTP stream closed");
+        endpoint.wait_idle().await;
+    });
+    Box::new(local)
+}
+
+async fn bridge_h3_client(
+    mut send: h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut recv: h3::client::RequestStream<h3_quinn::RecvStream, Bytes>,
+    carrier: tokio::io::DuplexStream,
+) {
+    let (mut reader, mut writer) = tokio::io::split(carrier);
+    let upload = async {
+        let mut buf = vec![0; 16 * 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = send.finish().await;
+                    break;
+                }
+                Ok(n) => {
+                    if send
+                        .send_data(Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    let download = async {
+        while let Ok(Some(mut data)) = recv.recv_data().await {
+            let bytes = data.copy_to_bytes(data.remaining());
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    };
+    tokio::join!(upload, download);
+}
+
+async fn handle_xhttp_stream<S>(
+    mut stream: S,
+    source: SocketAddr,
+    router: Arc<Router>,
+    tag: String,
+    users: Arc<HashMap<[u8; 16], String>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (destination, user) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_vless_request(&mut stream, &users))
+            .await
+            .context("VLESS XHTTP request timed out")??;
+    stream.write_all(&[VLESS_VERSION, 0]).await?;
+    let session = Session::inbound(Network::Tcp, source, destination, tag, "vless", Some(user));
+    router.route(session, Box::new(stream)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_h2_listener(
+    listener: TcpListener,
+    cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
+    slots: Arc<Semaphore>,
+    router: Arc<Router>,
+    tag: String,
+    path: String,
+    host: String,
+    headers: HashMap<String, String>,
+    users: Arc<HashMap<[u8; 16], String>>,
+    acceptor: Arc<TlsAcceptor>,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((tcp, source)) => {
+                    let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else { drop(tcp); continue; };
+                    let acceptor = acceptor.clone(); let router = router.clone(); let tag = tag.clone(); let path = path.clone(); let host = host.clone(); let headers = headers.clone(); let users = users.clone(); let connection_cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
+                        let _permit = permit;
+                        let result = async {
+                            let tls = acceptor.accept(tcp).await?;
+                            anyhow::ensure!(tls.get_ref().1.alpn_protocol() == Some(b"h2"), "VLESS XHTTP2 requires ALPN h2");
+                            let mut connection = h2::server::handshake(tls).await?;
+                            loop {
+                                let accepted = tokio::select! { _ = connection_cancel.cancelled() => break, value = connection.accept() => value };
+                                let Some(Ok((request, mut respond))) = accepted else { break; };
+                                let uri_path = request.uri().path();
+                                let valid = request.method() == http::Method::POST && uri_path == path && (host.is_empty() || request.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()).is_none_or(|v| v == host));
+                                if !valid { let status = if uri_path != path { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST }; let _ = respond.send_response(Response::builder().status(status).body(()).unwrap(), true); continue; }
+                                let denied = headers.iter().any(|(name, value)| http::header::HeaderName::try_from(name).ok().is_some_and(|name| request.headers().get(&name).and_then(|v| v.to_str().ok()) != Some(value)));
+                                if denied { let _ = respond.send_response(Response::builder().status(StatusCode::FORBIDDEN).body(()).unwrap(), true); continue; }
+                                let body = request.into_body();
+                                let Ok(send) = respond.send_response(Response::builder().status(StatusCode::OK).body(())?, false) else { continue; };
+                                let (local, carrier) = tokio::io::duplex(XHTTP_DUPLEX_CAPACITY);
+                                let (local_read, local_write) = tokio::io::split(local);
+                                let (carrier_read, carrier_write) = tokio::io::split(carrier);
+                                let pump = tokio::spawn(bridge_h2(send, body, tokio::io::join(carrier_read, carrier_write)));
+                                let _ = handle_xhttp_stream(tokio::io::join(local_read, local_write), source, router.clone(), tag.clone(), users.clone()).await;
+                                pump.abort();
+                            }
+                            anyhow::Ok(())
+                        }.await;
+                        if let Err(error) = result { tracing::debug!(%source, %error, "VLESS XHTTP2 connection closed"); }
+                    });
+                }
+                Err(error) => { tracing::debug!(%error, "VLESS XHTTP2 accept failed"); break; }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_h3_listener(
+    endpoint: quinn::Endpoint,
+    cancel: CancellationToken,
+    connection_tasks: ConnectionTasks,
+    slots: Arc<Semaphore>,
+    router: Arc<Router>,
+    tag: String,
+    path: String,
+    host: String,
+    headers: HashMap<String, String>,
+    users: Arc<HashMap<[u8; 16], String>>,
+) {
+    loop {
+        let incoming = tokio::select! { _ = cancel.cancelled() => break, incoming = endpoint.accept() => incoming };
+        let Some(incoming) = incoming else {
+            break;
+        };
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
+        let router = router.clone();
+        let tag = tag.clone();
+        let path = path.clone();
+        let host = host.clone();
+        let headers = headers.clone();
+        let users = users.clone();
+        let connection_cancel = cancel.clone();
+        connection_tasks.spawn(async move {
+            let _permit = permit;
+            let result = async {
+                let connection = incoming.await?;
+                let mut h3 = h3::server::builder().build::<_, Bytes>(h3_quinn::Connection::new(connection.clone())).await?;
+                loop {
+                    let resolver = tokio::select! { _ = connection_cancel.cancelled() => break, resolver = h3.accept() => resolver? };
+                    let Some(resolver) = resolver else { break; };
+                    let (request, mut stream) = resolver.resolve_request().await?;
+                    let valid = request.method() == http::Method::POST && request.uri().path() == path && (host.is_empty() || request.headers().get(http::header::HOST).and_then(|v|v.to_str().ok()).is_none_or(|v|v==host));
+                    if !valid { let status = if request.uri().path() != path {StatusCode::NOT_FOUND} else {StatusCode::BAD_REQUEST}; stream.send_response(Response::builder().status(status).body(())?).await?; stream.finish().await?; continue; }
+                    let mut denied = false;
+                    for (name,value) in &headers { if request.headers().get(name).and_then(|v|v.to_str().ok()) != Some(value) {denied=true;} }
+                    if denied { stream.send_response(Response::builder().status(StatusCode::FORBIDDEN).body(())?).await?; stream.finish().await?; continue; }
+                    stream.send_response(Response::builder().status(StatusCode::OK).body(())?).await?;
+                    let (local, carrier) = tokio::io::duplex(XHTTP_DUPLEX_CAPACITY);
+                    let (send, recv) = stream.split();
+                    let bridge = tokio::spawn(bridge_h3_server(send, recv, carrier));
+                    let source = connection.remote_address();
+                    let _ = handle_xhttp_stream(local, source, router.clone(), tag.clone(), users.clone()).await;
+                    bridge.abort();
+                }
+                anyhow::Ok(())
+            }.await;
+            if let Err(error) = result { tracing::debug!(%error, "VLESS XHTTP3 connection closed"); }
+        });
+    }
+}
+
+async fn bridge_h3_server(
+    mut send: h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+    carrier: tokio::io::DuplexStream,
+) {
+    let (mut reader, mut writer) = tokio::io::split(carrier);
+    let upload = async {
+        let mut buf = vec![0; 16 * 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = send.finish().await;
+                    break;
+                }
+                Ok(n) => {
+                    if send
+                        .send_data(Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    let download = async {
+        while let Ok(Some(mut data)) = recv.recv_data().await {
+            let bytes = data.copy_to_bytes(data.remaining());
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    };
+    tokio::join!(upload, download);
+}
+
 impl sing_box_core::Outbound for VlessOutbound {
     fn kind(&self) -> &'static str {
         "vless"
@@ -344,9 +895,16 @@ pub fn register(registry: &mut Registry) -> Result<()> {
             anyhow::ensure!(!options.server.is_empty(), "VLESS server cannot be empty");
             anyhow::ensure!(options.server_port != 0, "VLESS server_port cannot be zero");
             anyhow::ensure!(
-                options.transport.kind == "ws",
-                "VLESS only supports WebSocket transport"
+                matches!(options.transport.kind.as_str(), "ws" | "xhttp"),
+                "VLESS transport must be ws or xhttp"
             );
+            anyhow::ensure!(
+                matches!(options.transport.http_version.as_str(), "h2" | "h3"),
+                "VLESS XHTTP http_version must be h2 or h3"
+            );
+            if options.transport.kind == "xhttp" {
+                anyhow::ensure!(options.tls.enabled, "VLESS XHTTP requires TLS");
+            }
             anyhow::ensure!(
                 !options.transport.path.is_empty(),
                 "VLESS WebSocket path cannot be empty"
@@ -360,6 +918,9 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 server: options.server,
                 server_port: options.server_port,
                 uuid: parse_uuid(&options.uuid).context("parse VLESS outbound UUID")?,
+                transport_kind: options.transport.kind,
+                http_version: options.transport.http_version,
+                host: options.transport.host,
                 path: options.transport.path,
                 headers: options.transport.headers,
                 max_early_data: options.transport.max_early_data,
@@ -373,8 +934,12 @@ pub fn register(registry: &mut Registry) -> Result<()> {
         "vless",
         |context: InboundBuildContext, tag, options| async move {
             anyhow::ensure!(
-                options.transport.kind == "ws",
-                "VLESS only supports WebSocket transport"
+                matches!(options.transport.kind.as_str(), "ws" | "xhttp"),
+                "VLESS transport must be ws or xhttp"
+            );
+            anyhow::ensure!(
+                matches!(options.transport.http_version.as_str(), "h2" | "h3"),
+                "VLESS XHTTP http_version must be h2 or h3"
             );
             anyhow::ensure!(!options.users.is_empty(), "VLESS users cannot be empty");
             anyhow::ensure!(
@@ -386,7 +951,7 @@ pub fn register(registry: &mut Registry) -> Result<()> {
             } else {
                 format!("/{}", options.transport.path)
             };
-            let reality = if options.tls.enabled {
+            let reality = if options.tls.enabled && options.transport.kind == "ws" {
                 anyhow::ensure!(
                     options.tls.reality.enabled,
                     "VLESS TLS currently requires Reality"
@@ -399,6 +964,16 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 })?))
             } else {
                 None
+            };
+            let (tls_acceptor, h3_server_config) = if options.transport.kind == "xhttp" {
+                anyhow::ensure!(options.tls.enabled, "VLESS XHTTP requires TLS");
+                anyhow::ensure!(
+                    !options.tls.reality.enabled,
+                    "VLESS XHTTP does not support Reality"
+                );
+                build_xhttp_server_configs(&options.tls).await?
+            } else {
+                (None, None)
             };
             let mut users = HashMap::with_capacity(options.users.len());
             for (index, user) in options.users.into_iter().enumerate() {
@@ -416,6 +991,10 @@ pub fn register(registry: &mut Registry) -> Result<()> {
             }
             Ok(Arc::new(VlessInbound {
                 tag,
+                transport_kind: options.transport.kind,
+                http_version: options.transport.http_version,
+                host: options.transport.host,
+                headers: options.transport.headers,
                 path,
                 early_data_header_name: options.transport.early_data_header_name,
                 users: Arc::new(users),
@@ -425,9 +1004,57 @@ pub fn register(registry: &mut Registry) -> Result<()> {
                 running: Mutex::new(None),
                 local_addr: RwLock::new(None),
                 reality,
+                tls_acceptor,
+                h3_server_config,
             }) as Arc<dyn Inbound>)
         },
     )
+}
+
+async fn build_xhttp_server_configs(
+    options: &VlessTlsOptions,
+) -> Result<(Option<Arc<TlsAcceptor>>, Option<quinn::ServerConfig>)> {
+    anyhow::ensure!(
+        !options.certificate_path.is_empty(),
+        "VLESS XHTTP TLS certificate_path is empty"
+    );
+    anyhow::ensure!(
+        !options.key_path.is_empty(),
+        "VLESS XHTTP TLS key_path is empty"
+    );
+    let certificate_data = tokio::fs::read(&options.certificate_path)
+        .await
+        .with_context(|| format!("read {}", options.certificate_path))?;
+    let mut certificate_reader = Cursor::new(certificate_data);
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        !certificates.is_empty(),
+        "VLESS XHTTP certificate file contains no certificates"
+    );
+    let key_data = tokio::fs::read(&options.key_path)
+        .await
+        .with_context(|| format!("read {}", options.key_path))?;
+    let mut key_reader = Cursor::new(key_data);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .context("VLESS XHTTP private key is missing")?;
+    let build = |alpn: &[u8]| -> Result<Arc<RustlsServerConfig>> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut config = RustlsServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(certificates.clone(), key.clone_key())?;
+        config.alpn_protocols = vec![alpn.to_vec()];
+        Ok(Arc::new(config))
+    };
+    let h2 = build(b"h2")?;
+    let h3 = build(b"h3")?;
+    let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(h3)
+        .context("build VLESS XHTTP3 TLS configuration")?;
+    Ok((
+        Some(Arc::new(TlsAcceptor::from(h2))),
+        Some(quinn::ServerConfig::with_crypto(Arc::new(quic_tls))),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1647,6 +2274,9 @@ mod tests {
             server: server_address.ip().to_string(),
             server_port: server_address.port(),
             uuid,
+            transport_kind: "ws".to_owned(),
+            http_version: "h2".to_owned(),
+            host: String::new(),
             path: "/proxy".to_owned(),
             headers: HashMap::new(),
             max_early_data: 0,
@@ -1841,6 +2471,39 @@ mod tests {
 
         assert_eq!(destination, Address::new("127.0.0.1", 443).unwrap());
         assert_eq!(user, "test-user");
+    }
+
+    #[test]
+    fn builds_xhttp_uri_and_filters_transport_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("x-edge-key".to_owned(), "secret".to_owned());
+        headers.insert("host".to_owned(), "ignored.example".to_owned());
+        let request = build_xhttp_request(
+            "example.com:443",
+            "/tunnel",
+            Some("mode=stream-up"),
+            true,
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(
+            request.uri().to_string(),
+            "https://example.com:443/tunnel?mode=stream-up"
+        );
+        assert_eq!(request.headers().get("x-edge-key").unwrap(), "secret");
+        assert!(request.headers().get(http::header::HOST).is_none());
+    }
+
+    #[test]
+    fn normalizes_xhttp_path_and_ipv6_authority() {
+        assert_eq!(
+            xhttp_path("tunnel?mode=auto").unwrap(),
+            ("/tunnel".to_owned(), Some("mode=auto".to_owned()))
+        );
+        assert_eq!(http_authority("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert!(xhttp_path("/bad path").is_err());
+        assert!(xhttp_path("/bad#fragment").is_err());
     }
 
     #[test]

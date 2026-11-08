@@ -1,0 +1,36 @@
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-xhttp-h2-out",
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "d4f2ad1c-f6db-481e-91de-9d551f8885c9",
+      "transport": {
+        "type": "xhttp",
+        "path": "/tunnel",
+        "http_version": "h2",
+        "host": "vless.example.com"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "vless.example.com"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "vless-ws-out"
+  }
+}

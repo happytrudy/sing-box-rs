@@ -26,6 +26,8 @@ bytes = "1"
 capnp = "0.20"
 capnp-rpc = "0.20"
 h2 = "0.4"
+h3 = { path = "../sing-quic-rs/vendor/h3", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = { path = "../sing-quic-rs/vendor/h3-quinn" }
 quinn = { version = "0.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 futures = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
